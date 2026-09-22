@@ -16,6 +16,7 @@ local KB = ReplicatedStorage:WaitForChild("KombatBlox")
 local SharedUtil = require(KB.Modules.SharedUtil)
 local CombatConfig = require(KB.Modules.CombatConfig)
 local InputController = require(script.Parent.Parent.Input.InputController)
+local CameraController = require(script.Parent.Parent.Camera.CameraController)
 
 local RequestAction = SharedUtil.GetRemote("Combat", "RequestAction") :: RemoteEvent
 local CombatEvent = SharedUtil.GetRemote("Combat", "CombatEvent") :: RemoteEvent
@@ -199,31 +200,13 @@ function CombatController.SpawnHitVFX(position: Vector3?, color: Color3?, size: 
 	Debris:AddItem(p, 0.12)
 end
 
+-- Delega en CameraController (dueño unico de camara/FOV). Ver auditoria v1.3 B1:
+-- asi el shake sigue funcionando aunque la camara pase a Scriptable (lock-on).
 function CombatController.CameraShake(intensity: number?, duration: number?)
-	local character = LocalPlayer.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	if not humanoid then
-		return
-	end
-
-	local power = intensity or CombatConfig.CameraShakeIntensity
-	local time = duration or CombatConfig.CameraShakeDuration
-	local elapsed = 0
-	local conn
-	conn = RunService.RenderStepped:Connect(function(dt)
-		elapsed += dt
-		if elapsed >= time or humanoid.Health <= 0 then
-			humanoid.CameraOffset = Vector3.zero
-			conn:Disconnect()
-			return
-		end
-		local decay = 1 - (elapsed / time)
-		humanoid.CameraOffset = Vector3.new(
-			(math.random() - 0.5) * power * decay,
-			(math.random() - 0.5) * power * decay,
-			0
-		)
-	end)
+	CameraController.Shake(
+		intensity or CombatConfig.CameraShakeIntensity,
+		duration or CombatConfig.CameraShakeDuration
+	)
 end
 
 function CombatController.Hitstop(track: AnimationTrack?)
@@ -264,60 +247,9 @@ end
 ------------------------------------------------------------------
 -- Dash FX (solo presentacion)
 ------------------------------------------------------------------
-local fovToken = 0
-local baseFov: number? = nil
-local fovUpTween: Tween? = nil
-local fovDownTween: Tween? = nil
-
+-- FOV del dash: delega en CameraController (dueño unico del FOV). Ver auditoria v1.3 B6.
 local function fovKick()
-	local camera = workspace.CurrentCamera
-	if not camera then
-		return
-	end
-
-	-- Cancelar cualquier kick anterior antes de empezar (dashes consecutivos)
-	if fovUpTween then
-		fovUpTween:Cancel()
-		fovUpTween = nil
-	end
-	if fovDownTween then
-		fovDownTween:Cancel()
-		fovDownTween = nil
-	end
-
-	fovToken += 1
-	local token = fovToken
-	-- baseFov solo se captura en reposo: un kick encadenado reutiliza el FOV original
-	if not baseFov then
-		baseFov = camera.FieldOfView
-	end
-	local base = baseFov :: number
-
-	local up = TweenService:Create(
-		camera,
-		TweenInfo.new(DASH_FX.FovIn, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{ FieldOfView = base + DASH_FX.FovKick }
-	)
-	up.Completed:Connect(function(state)
-		if state ~= Enum.PlaybackState.Completed or fovToken ~= token then
-			return
-		end
-		local down = TweenService:Create(
-			camera,
-			TweenInfo.new(DASH_FX.FovOut, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
-			{ FieldOfView = base }
-		)
-		down.Completed:Connect(function(downState)
-			if downState == Enum.PlaybackState.Completed and fovToken == token then
-				baseFov = nil
-				fovDownTween = nil
-			end
-		end)
-		fovDownTween = down
-		down:Play()
-	end)
-	fovUpTween = up
-	up:Play()
+	CameraController.FovPunch(DASH_FX.FovKick, DASH_FX.FovIn, DASH_FX.FovOut)
 end
 
 local function spawnTrail(root: BasePart, duration: number)
