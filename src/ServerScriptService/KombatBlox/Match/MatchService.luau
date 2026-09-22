@@ -711,8 +711,17 @@ end
 -- API para CombatService (siempre en servidor)
 ------------------------------------------------------------------
 -- Nuevas acciones (M1, BlockStart, Dash). Fuera de partida: libre.
-function MatchService.CanAct(player)
-	local f = fighterByPlayer(player)
+-- Acepta un Player (jugador) o un Model (NPC). Fuera de partida: libre.
+local function fighterByRef(ref)
+	local f = fighterByPlayer(ref)
+	if not f and typeof(ref) == "Instance" and ref:IsA("Model") then
+		f = fighterByModel(ref)
+	end
+	return f
+end
+
+function MatchService.CanAct(ref)
+	local f = fighterByRef(ref)
 	if not f then
 		return true
 	end
@@ -721,8 +730,8 @@ end
 
 -- Golpes ya en su ventana activa: validos durante TODO Fighting (incluida la ventana de doble K.O.).
 -- Desde RoundEnd: corte total e irreversible.
-function MatchService.CanDealDamage(player)
-	local f = fighterByPlayer(player)
+function MatchService.CanDealDamage(ref)
+	local f = fighterByRef(ref)
 	if not f then
 		return true
 	end

@@ -5,6 +5,9 @@
 -- Dash:   Dash + direccion (saneada) -> estado Dashing + LinearVelocity temporal.
 -- v1.0a:  consulta a MatchService (CanAct / CanDealDamage / CanReceiveDamage),
 --         expone ResetFighter y ActionToken invalida ataques en curso tras un reset.
+-- v1.1:   ACTOR = Player (jugador) o Model (NPC). Misma tuberia de combate para ambos.
+--         API publica PerformAction / GetActorState / ResetFighter / ClearActor para que
+--         la IA use el combate real. Dano validado con MatchService.CanHit (seguridad PvP).
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -28,19 +31,56 @@ local CombatService = {}
 -- Se resuelve en Start. Si no existe, el combate funciona libre (sin partidas).
 local MatchService: any = nil
 
-local function canAct(player: Player): boolean
-	return MatchService == nil or MatchService.CanAct(player)
+------------------------------------------------------------------
+-- Actor: Player (jugador) o Model (NPC).
+-- La clave de estado es el propio ref. Para un jugador es estable entre respawns;
+-- para un NPC es su Model (se reconstruye cada round -> estado fresco, que es lo deseado).
+------------------------------------------------------------------
+type Actor = Player | Model
+
+-- Devuelve (player?, model?). player es nil para NPC.
+local function actorInfo(ref: any): (Player?, Model?)
+	if typeof(ref) == "Instance" then
+		if ref:IsA("Player") then
+			return ref, ref.Character
+		elseif ref:IsA("Model") then
+			return nil, ref
+		end
+	end
+	return nil, nil
 end
 
-local function canDealDamage(player: Player): boolean
-	return MatchService == nil or MatchService.CanDealDamage(player)
+local function refName(ref: any): string
+	local player, model = actorInfo(ref)
+	if player then
+		return player.Name
+	end
+	if model then
+		return model.Name
+	end
+	return "?"
 end
 
-local function canReceiveDamage(model: Model): boolean
-	return MatchService == nil or MatchService.CanReceiveDamage(model)
+local function canAct(ref: any): boolean
+	return MatchService == nil or MatchService.CanAct(ref)
 end
 
-type PlayerState = {
+local function canDealDamage(ref: any): boolean
+	return MatchService == nil or MatchService.CanDealDamage(ref)
+end
+
+-- Autoridad de dano v1.1: valida atacante Y victima por Model (cierra el agujero PvP).
+local function canHit(attackerModel: Model?, victimModel: Model): boolean
+	if MatchService == nil then
+		return true
+	end
+	if not attackerModel then
+		return false
+	end
+	return MatchService.CanHit(attackerModel, victimModel)
+end
+
+type ActorState = {
 	State: string,
 	ComboIndex: number,
 	ComboNext: string?,
@@ -57,10 +97,10 @@ type PlayerState = {
 	WindowStart: number,
 	WindowCount: number,
 }
-local states: {[Player]: PlayerState} = {}
+local states: {[any]: ActorState} = {}
 
-local function getState(player: Player): PlayerState
-	local s = states[player]
+local function getState(ref: any): ActorState
+	local s = states[ref]
 	if not s then
 		s = {
 			State = S.Idle,
@@ -79,12 +119,12 @@ local function getState(player: Player): PlayerState
 			WindowStart = os.clock(),
 			WindowCount = 0,
 		}
-		states[player] = s
+		states[ref] = s
 	end
 	return s
 end
 
-local function resetCombo(state: PlayerState)
+local function resetCombo(state: ActorState)
 	state.ComboIndex = 0
 	state.ComboNext = nil
 	state.ComboExpires = 0
@@ -92,7 +132,7 @@ local function resetCombo(state: PlayerState)
 	state.BufferOpen = false
 end
 
-local function passesRateLimit(state: PlayerState): boolean
+local function passesRateLimit(state: ActorState): boolean
 	local now = os.clock()
 	if now - state.WindowStart >= 1 then
 		state.WindowStart = now
@@ -102,31 +142,31 @@ local function passesRateLimit(state: PlayerState): boolean
 	return state.WindowCount <= CombatConfig.MaxRequestsPerSecond
 end
 
-local function getLiving(player: Player): (Model?, BasePart?)
-	local character = player.Character
-	if not character then
+local function getLiving(ref: any): (Model?, BasePart?)
+	local _, model = actorInfo(ref)
+	if not model then
 		return nil
 	end
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	local root = character:FindFirstChild("HumanoidRootPart") :: BasePart?
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local root = model:FindFirstChild("HumanoidRootPart") :: BasePart?
 	if not humanoid or not root then
 		return nil
 	end
 	if humanoid.Health <= 0 then
 		return nil
 	end
-	return character, root
+	return model, root
 end
 
 ------------------------------------------------------------------
 -- Block
 ------------------------------------------------------------------
-local function clearBlock(player: Player)
-	local s = getState(player)
-	local character = player.Character
-	if character then
-		character:SetAttribute(BLOCK_ATTR, false)
-		local humanoid = character:FindFirstChildOfClass("Humanoid")
+local function clearBlock(ref: any)
+	local s = getState(ref)
+	local player, model = actorInfo(ref)
+	if model then
+		model:SetAttribute(BLOCK_ATTR, false)
+		local humanoid = model:FindFirstChildOfClass("Humanoid")
 		if humanoid and s.SavedWalkSpeed then
 			humanoid.WalkSpeed = s.SavedWalkSpeed
 		end
@@ -135,43 +175,46 @@ local function clearBlock(player: Player)
 	CombatEvent:FireAllClients({
 		Type = "BlockChanged",
 		Target = player,
+		Model = model,
 		Blocking = false,
 	})
 end
 
-local function startBlock(player: Player)
-	local s = getState(player)
+local function startBlock(ref: any)
+	local s = getState(ref)
 	if s.State ~= S.Idle then
 		return
 	end
-	local character = getLiving(player)
-	if not character then
+	local model = getLiving(ref)
+	if not model then
 		return
 	end
-	local humanoid = character:FindFirstChildOfClass("Humanoid") :: Humanoid
+	local player = actorInfo(ref)
+	local humanoid = model:FindFirstChildOfClass("Humanoid") :: Humanoid
 
 	s.State = S.Blocking
 	resetCombo(s)
 	s.SavedWalkSpeed = humanoid.WalkSpeed
 	humanoid.WalkSpeed = BLOCK.WalkSpeed
-	character:SetAttribute(BLOCK_ATTR, true)
-	SharedUtil.Log(TAG, player.Name .. " block ON")
+	model:SetAttribute(BLOCK_ATTR, true)
+	SharedUtil.Log(TAG, refName(ref) .. " block ON")
 
 	CombatEvent:FireAllClients({
 		Type = "BlockChanged",
 		Target = player,
+		Model = model,
 		Blocking = true,
 	})
 end
 
-local function endBlock(player: Player)
-	local s = getState(player)
+local function endBlock(ref: any)
+	local s = getState(ref)
 	if s.State ~= S.Blocking then
 		return
 	end
-	clearBlock(player)
+	clearBlock(ref)
 	s.State = S.Idle
-	SharedUtil.Log(TAG, player.Name .. " block OFF")
+	SharedUtil.Log(TAG, refName(ref) .. " block OFF")
 end
 
 local function isBlockingFrom(victimModel: Model, attackerRoot: BasePart): boolean
@@ -217,8 +260,8 @@ local function sanitizeDirection(raw: any, root: BasePart): Vector3
 	return flatLook.Unit
 end
 
-local function stopDash(player: Player)
-	local s = getState(player)
+local function stopDash(ref: any)
+	local s = getState(ref)
 	s.DashToken += 1
 	if s.DashAttachment then
 		s.DashAttachment:Destroy()
@@ -226,15 +269,16 @@ local function stopDash(player: Player)
 	end
 end
 
-local function startDash(player: Player, rawDirection: any)
-	local s = getState(player)
+local function startDash(ref: any, rawDirection: any)
+	local s = getState(ref)
 	if s.State ~= S.Idle then
 		return
 	end
-	local character, root = getLiving(player)
-	if not (character and root) then
+	local model, root = getLiving(ref)
+	if not (model and root) then
 		return
 	end
+	local player = actorInfo(ref)
 
 	local now = os.clock()
 	if s.LastDash and now - s.LastDash < DASH.Cooldown then
@@ -243,7 +287,7 @@ local function startDash(player: Player, rawDirection: any)
 	s.LastDash = now
 
 	resetCombo(s)
-	stopDash(player)
+	stopDash(ref)
 	s.State = S.Dashing
 	local token = s.DashToken
 
@@ -268,20 +312,21 @@ local function startDash(player: Player, rawDirection: any)
 	attachment.Parent = root
 	s.DashAttachment = attachment
 
-	SharedUtil.Log(TAG, player.Name .. " DASH")
+	SharedUtil.Log(TAG, refName(ref) .. " DASH")
 	CombatEvent:FireAllClients({
 		Type = "DashStarted",
 		Target = player,
+		Model = model,
 		Direction = direction,
 		Duration = DASH.Duration,
 	})
 
 	task.delay(DASH.Duration, function()
-		local current = states[player]
+		local current = states[ref]
 		if not current or current.DashToken ~= token then
 			return
 		end
-		stopDash(player)
+		stopDash(ref)
 		if current.State == S.Dashing then
 			current.State = S.Idle
 		end
@@ -333,13 +378,14 @@ end
 ------------------------------------------------------------------
 -- Impacto
 ------------------------------------------------------------------
-local function applyStun(victim: Player, duration: number, stunState: string)
-	local s = getState(victim)
+-- victimRef es el Player de la victima si lo hay; si no (NPC), su Model.
+local function applyStun(victimRef: any, duration: number, stunState: string)
+	local s = getState(victimRef)
 	if s.State == S.Blocking then
-		clearBlock(victim)
+		clearBlock(victimRef)
 	end
 	if s.State == S.Dashing then
-		stopDash(victim)
+		stopDash(victimRef)
 	end
 	resetCombo(s)
 	s.State = stunState
@@ -347,7 +393,7 @@ local function applyStun(victim: Player, duration: number, stunState: string)
 	local token = s.StunToken
 
 	task.delay(duration, function()
-		local current = states[victim]
+		local current = states[victimRef]
 		if current and current.StunToken == token and current.State == stunState then
 			current.State = S.Idle
 		end
@@ -355,21 +401,22 @@ local function applyStun(victim: Player, duration: number, stunState: string)
 end
 
 -- Devuelve "hit", "blocked", "guardbreak" o "none" (la partida no permite dano)
-local function onHit(player: Player, action: string, cfg: any, hum: Humanoid, attackerRoot: BasePart): string
+local function onHit(ref: any, attackerModel: Model, action: string, cfg: any, hum: Humanoid, attackerRoot: BasePart): string
 	local victimModel = hum.Parent :: Model
-	if not canReceiveDamage(victimModel) then
+	if not canHit(attackerModel, victimModel) then
 		return "none"
 	end
 
+	local player = actorInfo(ref)   -- atacante (nil si NPC): solo para feedback de cliente
 	local victimRoot = victimModel:FindFirstChild("HumanoidRootPart") :: BasePart?
 	local hitPosition = victimRoot and victimRoot.Position or Vector3.zero
 	local victim = Players:GetPlayerFromCharacter(victimModel)
+	local victimRef: any = victim or victimModel   -- para hitstun (jugador o NPC)
 
 	if isBlockingFrom(victimModel, attackerRoot) then
 		if cfg.GuardBreak then
-			if victim then
-				applyStun(victim, cfg.GuardBreakStun or 1, S.Stunned)
-			else
+			applyStun(victimRef, cfg.GuardBreakStun or 1, S.Stunned)
+			if not victim then
 				victimModel:SetAttribute(BLOCK_ATTR, false)
 			end
 			hum:TakeDamage(cfg.Damage)
@@ -383,7 +430,9 @@ local function onHit(player: Player, action: string, cfg: any, hum: Humanoid, at
 				Damage = cfg.Damage,
 				HitPosition = hitPosition,
 			}
-			CombatEvent:FireClient(player, payload)
+			if player then
+				CombatEvent:FireClient(player, payload)
+			end
 			if victim then
 				CombatEvent:FireClient(victim, payload)
 			end
@@ -403,7 +452,9 @@ local function onHit(player: Player, action: string, cfg: any, hum: Humanoid, at
 			Attacker = player,
 			HitPosition = hitPosition,
 		}
-		CombatEvent:FireClient(player, payload)
+		if player then
+			CombatEvent:FireClient(player, payload)
+		end
 		if victim then
 			CombatEvent:FireClient(victim, payload)
 		end
@@ -413,16 +464,18 @@ local function onHit(player: Player, action: string, cfg: any, hum: Humanoid, at
 	hum:TakeDamage(cfg.Damage)
 	SharedUtil.Log(TAG, ("Hit %s for %d (%s)"):format(victimModel.Name, cfg.Damage, action))
 
-	CombatEvent:FireClient(player, {
-		Type = "HitConfirmed",
-		Action = action,
-		Damage = cfg.Damage,
-		Victim = victimModel.Name,
-		HitPosition = hitPosition,
-	})
+	if player then
+		CombatEvent:FireClient(player, {
+			Type = "HitConfirmed",
+			Action = action,
+			Damage = cfg.Damage,
+			Victim = victimModel.Name,
+			HitPosition = hitPosition,
+		})
+	end
 
+	applyStun(victimRef, cfg.Hitstun or 0.2, S.Hitstun)
 	if victim then
-		applyStun(victim, cfg.Hitstun or 0.2, S.Hitstun)
 		CombatEvent:FireClient(victim, {
 			Type = "HitReceived",
 			Action = action,
@@ -431,8 +484,13 @@ local function onHit(player: Player, action: string, cfg: any, hum: Humanoid, at
 			HitPosition = hitPosition,
 			Hitstun = cfg.Hitstun or 0.2,
 		})
-	elseif victimModel:GetAttribute(BLOCK_ATTR) == true then
-		victimModel:SetAttribute(BLOCK_ATTR, false)
+	else
+		-- NPC golpeado: reaccion visible para todos (el dummy no tiene cliente propio)
+		CombatEvent:FireAllClients({
+			Type = "HitReactionModel",
+			Model = victimModel,
+			HitPosition = hitPosition,
+		})
 	end
 	return "hit"
 end
@@ -442,10 +500,12 @@ end
 ------------------------------------------------------------------
 local executeAction
 
-executeAction = function(player: Player, action: string, cfg: any)
-	local state = getState(player)
+executeAction = function(ref: any, action: string, cfg: any)
+	local state = getState(ref)
 	state.ActionToken += 1
 	local token = state.ActionToken   -- si cambia (ResetFighter/respawn), este ataque queda anulado
+
+	local player, model = actorInfo(ref)
 
 	state.State = S.Attacking
 	state.BufferOpen = false
@@ -460,6 +520,7 @@ executeAction = function(player: Player, action: string, cfg: any)
 		AttackSFX = cfg.AttackSFX,
 		ComboIndex = state.ComboIndex,
 		Attacker = player,
+		AttackerModel = model,
 	})
 
 	task.wait(cfg.Startup)
@@ -470,26 +531,26 @@ executeAction = function(player: Player, action: string, cfg: any)
 	local hitSet: {[Humanoid]: boolean} = {}
 	local hitCount = 0
 	local blockedCount = 0
-	local char, root = getLiving(player)
-	if char and root and canDealDamage(player) then
+	local char, root = getLiving(ref)
+	if char and root and canDealDamage(ref) then
 		debugBox(root.CFrame * CFrame.new(cfg.HitboxOffset), cfg.HitboxSize, cfg.ActiveTime)
 		local elapsed = 0
 		while elapsed < cfg.ActiveTime do
 			if state.ActionToken ~= token then
 				return
 			end
-			local c, r = getLiving(player)
+			local c, r = getLiving(ref)
 			if not (c and r) then
 				break
 			end
 			-- Corte irreversible: si la ronda deja de estar en Fighting, el golpe deja de danar
-			if not canDealDamage(player) then
+			if not canDealDamage(ref) then
 				break
 			end
 			for _, hum in queryHitbox(c, r, cfg) do
 				if not hitSet[hum] then
 					hitSet[hum] = true
-					local outcome = onHit(player, action, cfg, hum, r)
+					local outcome = onHit(ref, c, action, cfg, hum, r)
 					if outcome == "blocked" then
 						blockedCount += 1
 					elseif outcome ~= "none" then
@@ -501,13 +562,15 @@ executeAction = function(player: Player, action: string, cfg: any)
 		end
 	end
 
-	CombatEvent:FireClient(player, {
-		Type = "AttackResult",
-		Action = action,
-		Hit = hitCount > 0,
-		Targets = hitCount,
-		Blocked = blockedCount,
-	})
+	if player then
+		CombatEvent:FireClient(player, {
+			Type = "AttackResult",
+			Action = action,
+			Hit = hitCount > 0,
+			Targets = hitCount,
+			Blocked = blockedCount,
+		})
+	end
 
 	state.BufferOpen = true
 	task.wait(cfg.Recovery)
@@ -523,11 +586,11 @@ executeAction = function(player: Player, action: string, cfg: any)
 	local nextAction = cfg.ComboNext
 	local nextCfg = nextAction and CombatConfig.Actions[nextAction]
 
-	if state.Buffered and nextCfg and canAct(player) then
+	if state.Buffered and nextCfg and canAct(ref) then
 		state.Buffered = false
-		local c, r = getLiving(player)
+		local c, r = getLiving(ref)
 		if c and r then
-			executeAction(player, nextAction, nextCfg)
+			executeAction(ref, nextAction, nextCfg)
 			return
 		end
 	end
@@ -543,7 +606,7 @@ executeAction = function(player: Player, action: string, cfg: any)
 	end
 end
 
-local function resolveNextAction(state: PlayerState, rootAction: string): string
+local function resolveNextAction(state: ActorState, rootAction: string): string
 	if state.ComboNext and os.clock() <= state.ComboExpires then
 		return state.ComboNext
 	end
@@ -551,42 +614,37 @@ local function resolveNextAction(state: PlayerState, rootAction: string): string
 	return rootAction
 end
 
-local function onRequestAction(player: Player, action: any, payload: any)
-	if typeof(action) ~= "string" then
-		return
-	end
-
-	-- BlockEnd NUNCA pasa por rate limit ni por la partida (perderlo dejaria al jugador bloqueando).
+-- Nucleo de despacho de acciones. Lo usan tanto los jugadores (via Remote) como la IA
+-- (via CombatService.PerformAction). NO aplica el rate-limit del Remote (eso es del wrapper).
+local function performAction(ref: any, action: string, payload: any)
+	-- BlockEnd NUNCA pasa por la partida (perderlo dejaria al actor bloqueando).
 	if action == "BlockEnd" then
-		endBlock(player)
-		return
-	end
-
-	local state = getState(player)
-	if not passesRateLimit(state) then
+		endBlock(ref)
 		return
 	end
 
 	-- La partida decide si se puede actuar (Countdown, RoundEnd, MatchEnd, K.O. pendiente: no)
-	if not canAct(player) then
+	if not canAct(ref) then
 		return
 	end
 
 	if action == "BlockStart" then
-		startBlock(player)
+		startBlock(ref)
 		return
 	end
 
 	if action == "Dash" then
-		startDash(player, payload)
+		startDash(ref, payload)
 		return
 	end
 
 	local rootAction = CombatConfig.InputActions[action]
 	if not rootAction then
-		SharedUtil.Warn(TAG, player.Name .. " unknown action: " .. action)
+		SharedUtil.Warn(TAG, refName(ref) .. " unknown action: " .. action)
 		return
 	end
+
+	local state = getState(ref)
 
 	if state.State == S.Attacking then
 		if state.BufferOpen then
@@ -599,7 +657,7 @@ local function onRequestAction(player: Player, action: any, payload: any)
 		return
 	end
 
-	local character, root = getLiving(player)
+	local character, root = getLiving(ref)
 	if not character or not root then
 		return
 	end
@@ -617,25 +675,71 @@ local function onRequestAction(player: Player, action: any, payload: any)
 	end
 	state.LastAction[nextAction] = now
 
-	SharedUtil.Log(TAG, player.Name .. " " .. nextAction .. " requested")
-	task.spawn(executeAction, player, nextAction, cfg)
+	SharedUtil.Log(TAG, refName(ref) .. " " .. nextAction .. " requested")
+	task.spawn(executeAction, ref, nextAction, cfg)
+end
+
+-- Wrapper del Remote: valida entrada + rate-limit y delega en performAction.
+local function onRequestAction(player: Player, action: any, payload: any)
+	if typeof(action) ~= "string" then
+		return
+	end
+
+	-- BlockEnd NUNCA pasa por rate limit (soltar la guardia no debe perderse jamas).
+	if action == "BlockEnd" then
+		endBlock(player)
+		return
+	end
+
+	local state = getState(player)
+	if not passesRateLimit(state) then
+		return
+	end
+
+	performAction(player, action, payload)
+end
+
+------------------------------------------------------------------
+-- API publica (jugadores via Remote; IA via estas funciones)
+------------------------------------------------------------------
+-- La IA del NPC inyecta acciones EXACTAMENTE como un jugador: "LightAttack",
+-- "BlockStart"/"BlockEnd", "Dash" (+ direccion). Cero reglas de combate en la IA.
+function CombatService.PerformAction(actorRef: Actor, action: string, payload: any?)
+	if typeof(action) ~= "string" then
+		return
+	end
+	performAction(actorRef, action, payload)
+end
+
+-- Estado de combate real de un actor (solo lectura). La IA lo consulta para no pisarse:
+-- solo decide cuando esta "Idle"; respeta Attacking/Blocking/Dashing/Hitstun/Stunned.
+function CombatService.GetActorState(actorRef: Actor): string
+	local s = states[actorRef]
+	return s and s.State or S.Idle
 end
 
 ------------------------------------------------------------------
 -- API para MatchService
 ------------------------------------------------------------------
 -- Reset atomico: combo, bloqueo (atributo + WalkSpeed), dash, hitstun, stun y ataques en curso.
-function CombatService.ResetFighter(player: Player)
-	local s = getState(player)
-	local character = player.Character
-	if s.State == S.Blocking or (character and character:GetAttribute(BLOCK_ATTR) == true) then
-		clearBlock(player)
+-- Acepta Player (jugador) o Model (NPC).
+function CombatService.ResetFighter(actorRef: Actor)
+	local s = getState(actorRef)
+	local _, model = actorInfo(actorRef)
+	if s.State == S.Blocking or (model and model:GetAttribute(BLOCK_ATTR) == true) then
+		clearBlock(actorRef)
 	end
-	stopDash(player)
+	stopDash(actorRef)
 	resetCombo(s)
 	s.StunToken += 1
 	s.ActionToken += 1
 	s.State = S.Idle
+end
+
+-- Libera el estado asociado a un actor (evita fugas al descartar el Model de un NPC).
+function CombatService.ClearActor(actorRef: Actor)
+	CombatService.ResetFighter(actorRef)
+	states[actorRef] = nil
 end
 
 ------------------------------------------------------------------
