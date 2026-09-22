@@ -378,8 +378,9 @@ local function spawnPuff(position: Vector3)
 	Debris:AddItem(p, DASH_FX.PuffTime + 0.05)
 end
 
-local function playDashFx(player: Player, direction: any, duration: number)
-	local character = player.Character
+-- character puede ser el personaje de un jugador o el Model de un NPC.
+-- isLocal = true solo cuando dashea el jugador local (efectos de camara/sonido propios).
+local function playDashFx(character: Model?, direction: any, duration: number, isLocal: boolean)
 	local root = character and character:FindFirstChild("HumanoidRootPart") :: BasePart?
 	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 	if not (character and root and humanoid) then
@@ -402,8 +403,8 @@ local function playDashFx(player: Player, direction: any, duration: number)
 	local feetOffset = humanoid.HipHeight + root.Size.Y / 2
 	spawnPuff(root.Position - Vector3.new(0, feetOffset, 0))
 
-	-- Sensacion de velocidad (solo quien dashea)
-	if player == LocalPlayer then
+	-- Sensacion de velocidad (solo quien dashea, si es el jugador local)
+	if isLocal then
 		playSFX(DASH_FX.SFX)
 		fovKick()
 		CombatController.CameraShake(DASH_FX.ShakeIntensity, DASH_FX.ShakeDuration)
@@ -462,13 +463,26 @@ local function characterOf(player: any): Model?
 	return nil
 end
 
+-- Resuelve el Model de un actor a partir de los campos del evento: personaje del
+-- Player si lo hay, o el Model directo (NPC). Asi el Dummy tambien se anima.
+local function modelOf(playerField: any, modelField: any): Model?
+	local character = characterOf(playerField)
+	if character then
+		return character
+	end
+	if typeof(modelField) == "Instance" and modelField:IsA("Model") then
+		return modelField
+	end
+	return nil
+end
+
 local function onCombatEvent(data: any)
 	if typeof(data) ~= "table" then
 		return
 	end
 
 	if data.Type == "ActionStarted" then
-		local character = characterOf(data.Attacker)
+		local character = modelOf(data.Attacker, data.AttackerModel)
 		if character then
 			local track = CombatController.PlayAttackAnimation(character, data.Animation)
 			if data.Attacker == LocalPlayer then
@@ -478,15 +492,23 @@ local function onCombatEvent(data: any)
 		end
 
 	elseif data.Type == "DashStarted" then
-		if typeof(data.Target) == "Instance" and data.Target:IsA("Player") then
+		local character = modelOf(data.Target, data.Model)
+		if character then
 			if data.Target == LocalPlayer then
 				SharedUtil.Log("Combat", "DASH")
 			end
-			playDashFx(data.Target, data.Direction, data.Duration or DASH.Duration)
+			playDashFx(character, data.Direction, data.Duration or DASH.Duration, data.Target == LocalPlayer)
+		end
+
+	elseif data.Type == "HitReactionModel" then
+		-- Reaccion de golpe de un NPC (no tiene cliente propio)
+		local character = modelOf(nil, data.Model)
+		if character then
+			CombatController.PlayHitReaction(character)
 		end
 
 	elseif data.Type == "BlockChanged" then
-		local character = characterOf(data.Target)
+		local character = modelOf(data.Target, data.Model)
 		if character then
 			if data.Blocking then
 				playTrack(character, BLOCK.AnimationFolder, BLOCK.Animation)
