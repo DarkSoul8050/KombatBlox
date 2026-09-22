@@ -3,11 +3,8 @@
 -- Lee el snapshot de MatchService y, SOLO durante Fighting, decide por cada Fighter NPC.
 -- No conoce las reglas del combate: cada decision se ejecuta via CombatService.PerformAction.
 --
--- Integracion con la partida (sin acoplarse a internals de MatchService):
---   * Usa MatchService.GetSnapshot() -> Fighters {A,B} con Model / Player / IsNPC / Id.
---   * El rival de un NPC es el OTRO Fighter del match (por Id), no "el mas cercano".
---   * Fuera de Fighting: detiene y descarta los cerebros. NPC reconstruido cada round
---     => Model nuevo => cerebro nuevo (se limpia el estado del Model anterior).
+-- v1.2: dificultad seleccionable en caliente por el atributo de Workspace
+-- KB_AIDifficulty ("Easy"/"Normal"/"Hard"). Si cambia, se recrean los cerebros.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -23,12 +20,13 @@ local AIService = {}
 
 local MatchService: any = nil
 local CombatService: any = nil
-local profile = AIConfig.Difficulties[AIConfig.Default]
+
+local currentProfile = AIConfig.Difficulties[AIConfig.Default]
+local currentName = AIConfig.Default
 
 -- Cerebros activos, keyed por el Model del NPC.
 local brains: {[Model]: any} = {}
 
--- Descarta un cerebro y libera el estado de combate del Model.
 local function dropBrain(model: Model)
 	local brain = brains[model]
 	if brain then
@@ -46,8 +44,25 @@ local function dropAll()
 	end
 end
 
--- Empareja el estado interno con el snapshot: crea cerebros para NPC nuevos,
--- descarta los que ya no correspondan.
+-- Lee el atributo de dificultad de Workspace y actualiza el perfil activo.
+-- Si el valor no existe o es invalido, usa el Default. Devuelve true si cambio.
+local function refreshDifficulty(): boolean
+	local raw = workspace:GetAttribute(AIConfig.DifficultyAttribute)
+	local name = typeof(raw) == "string" and raw or AIConfig.Default
+	local profile = AIConfig.Difficulties[name]
+	if not profile then
+		name = AIConfig.Default
+		profile = AIConfig.Difficulties[name]
+	end
+	if name ~= currentName then
+		currentName = name
+		currentProfile = profile
+		SharedUtil.Log(TAG, "Dificultad -> " .. name)
+		return true
+	end
+	return false
+end
+
 local function reconcile(fighters: { A: any?, B: any? })
 	local alive: {[Model]: boolean} = {}
 
@@ -57,13 +72,12 @@ local function reconcile(fighters: { A: any?, B: any? })
 			local model = f.Model :: Model
 			alive[model] = true
 			if not brains[model] then
-				brains[model] = DummyBrain.new(model, { Combat = CombatService, Profile = profile })
+				brains[model] = DummyBrain.new(model, { Combat = CombatService, Profile = currentProfile })
 				SharedUtil.Log(TAG, "Cerebro creado para " .. model.Name)
 			end
 		end
 	end
 
-	-- Descartar cerebros cuyo Model ya no esta en la partida (round nuevo, KO, etc.)
 	for model in brains do
 		if not alive[model] then
 			dropBrain(model)
@@ -95,15 +109,28 @@ function AIService:Start()
 	MatchService = m
 	CombatService = c
 
-	if not (profile and MatchService.GetSnapshot) then
+	if not (currentProfile and MatchService.GetSnapshot) then
 		SharedUtil.Warn(TAG, "AIConfig o MatchService.GetSnapshot no disponibles: IA inactiva")
 		return
 	end
 
+	-- Deja el atributo visible/editable en Studio (Workspace -> Attributes) con el default.
+	if workspace:GetAttribute(AIConfig.DifficultyAttribute) == nil then
+		workspace:SetAttribute(AIConfig.DifficultyAttribute, AIConfig.Default)
+	end
+	refreshDifficulty()
+
+	-- Cambio de dificultad en caliente: recrea los cerebros con el nuevo perfil.
+	workspace:GetAttributeChangedSignal(AIConfig.DifficultyAttribute):Connect(function()
+		if refreshDifficulty() then
+			dropAll()
+		end
+	end)
+
 	local accum = 0
 	RunService.Heartbeat:Connect(function(dt: number)
 		accum += dt
-		if accum < profile.DecisionInterval then
+		if accum < currentProfile.DecisionInterval then
 			return
 		end
 		accum = 0
@@ -111,7 +138,6 @@ function AIService:Start()
 		local snap = MatchService.GetSnapshot()
 		local fighters = snap and snap.Fighters
 
-		-- Solo se decide durante Fighting; en cualquier otro estado, cerebros parados.
 		if not (snap and snap.State == "Fighting" and fighters) then
 			if next(brains) ~= nil then
 				dropAll()
@@ -132,7 +158,7 @@ function AIService:Start()
 		end
 	end)
 
-	SharedUtil.Log(TAG, "AIService listo (dificultad " .. AIConfig.Default .. ")")
+	SharedUtil.Log(TAG, "AIService v1.2 listo (dificultad " .. currentName .. ")")
 end
 
 return AIService
