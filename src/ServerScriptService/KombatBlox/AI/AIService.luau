@@ -120,6 +120,32 @@ function AIService:Start()
 	end
 	refreshDifficulty()
 
+	-- Remote para que la UI de practica cambie la dificultad (el servidor es la autoridad).
+	-- Se crea en runtime bajo Remotes/AI (no vive en el place). Se valida el valor recibido.
+	local remotes = KB:FindFirstChild("Remotes")
+	if not remotes then
+		remotes = Instance.new("Folder")
+		remotes.Name = "Remotes"
+		remotes.Parent = KB
+	end
+	local aiFolder = remotes:FindFirstChild("AI")
+	if not aiFolder then
+		aiFolder = Instance.new("Folder")
+		aiFolder.Name = "AI"
+		aiFolder.Parent = remotes
+	end
+	local setDifficulty = aiFolder:FindFirstChild("SetDifficulty")
+	if not setDifficulty then
+		setDifficulty = Instance.new("RemoteEvent")
+		setDifficulty.Name = "SetDifficulty"
+		setDifficulty.Parent = aiFolder
+	end
+	;(setDifficulty :: RemoteEvent).OnServerEvent:Connect(function(_player, name)
+		if typeof(name) == "string" and AIConfig.Difficulties[name] then
+			workspace:SetAttribute(AIConfig.DifficultyAttribute, name)
+		end
+	end)
+
 	-- Cambio de dificultad en caliente: recrea los cerebros con el nuevo perfil.
 	workspace:GetAttributeChangedSignal(AIConfig.DifficultyAttribute):Connect(function()
 		if refreshDifficulty() then
