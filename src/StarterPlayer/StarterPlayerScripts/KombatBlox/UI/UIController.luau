@@ -1,7 +1,7 @@
--- UIController (cliente): HUD de combate.
--- SOLO muestra informacion. No decide ni modifica nada del combate.
--- Rival (provisional hasta MatchService): Humanoid vivo mas cercano, con histeresis.
--- v0.9.1: K.O. limpia el contador, DamageTrail, flash, sacudida de panel, pulso de DASH.
+-- UIController (cliente): HUD de partida (v1.0b).
+-- SOLO representa. La fuente de verdad es el snapshot de MatchStateChanged (contrato v1).
+-- Barras: fighter propio (izquierda) y rival (derecha). Espectador: A izquierda, B derecha.
+-- Mantiene el polish de v0.9.1: DamageTrail, flash, sacudida de panel, K.O., pulso de DASH.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -12,23 +12,22 @@ local KB = ReplicatedStorage:WaitForChild("KombatBlox")
 local SharedUtil = require(KB.Modules.SharedUtil)
 local CombatConfig = require(KB.Modules.CombatConfig)
 local CombatEvent = SharedUtil.GetRemote("Combat", "CombatEvent")
+local MatchStateChanged = SharedUtil.GetRemote("Match", "MatchStateChanged")
+local GetMatchState = SharedUtil.GetRemote("Match", "GetMatchState")
 
 local LocalPlayer = Players.LocalPlayer
 
 local HUD_CFG = {
 	TopOffset = 64,            -- px: por debajo de la barra superior de Roblox
-	RivalRange = 60,           -- studs: distancia maxima para considerar rival
-	RivalSwitchRatio = 0.75,   -- otro candidato debe estar al 75% de la distancia actual
-	RivalScanInterval = 0.25,  -- segundos entre busquedas de rival
-	KODisplay = 2.5,           -- segundos que se muestra el K.O. del rival
-
 	FillTween = 0.08,          -- la barra principal baja casi al instante
 	TrailDelay = 0.35,         -- la franja de dano espera antes de consumirse
 	TrailDuration = 0.4,       -- y se consume en este tiempo
 	StrongHitRatio = 0.12,     -- perdida >= 12% de la vida maxima = flash fuerte
+	FightBannerTime = 0.9,     -- segundos que se ve FIGHT!
+	RefetchDelay = 0.5,        -- espera antes de volver a pedir el snapshot (Model sin replicar)
+	MaxRefetch = 6,            -- intentos maximos por estado
 }
 
--- Sacudida del panel por nivel
 local SHAKE = {
 	Light = { Amplitude = 4, Duration = 0.15 },
 	Heavy = { Amplitude = 9, Duration = 0.25 },
@@ -46,21 +45,56 @@ local COLORS = {
 	Ready = Color3.fromRGB(255, 255, 255),
 	Cooling = Color3.fromRGB(120, 120, 130),
 	Panel = Color3.fromRGB(20, 20, 26),
+	Pip = Color3.fromRGB(255, 205, 70),
+	Fight = Color3.fromRGB(255, 220, 60),
+	Victory = Color3.fromRGB(255, 205, 70),
+	Defeat = Color3.fromRGB(170, 170, 185),
+}
+
+local REASON_TEXT = {
+	KO = "K.O.",
+	DoubleKO = "DOUBLE K.O.",
+	Time = "TIME",
+	Draw = "DRAW",
+}
+
+-- Estilos de cartel: From -> (Peak) -> 1
+local STYLES = {
+	Count   = { From = 1.4, Peak = nil,  In = 0.18, Settle = 0,    Color = COLORS.Text,    TextSize = 96 },
+	Round   = { From = 0.8, Peak = 1.05, In = 0.15, Settle = 0.12, Color = COLORS.Text,    TextSize = 44 },
+	Fight   = { From = 0.7, Peak = 1.15, In = 0.12, Settle = 0.1,  Color = COLORS.Fight,   TextSize = 110 },
+	Impact  = { From = 1.5, Peak = nil,  In = 0.12, Settle = 0,    Color = COLORS.KO,      TextSize = 110, Shake = "Heavy" },
+	Result  = { From = 0.8, Peak = 1.05, In = 0.15, Settle = 0.12, Color = COLORS.Text,    TextSize = 96 },
+	Victory = { From = 0.6, Peak = 1.1,  In = 0.25, Settle = 0.15, Color = COLORS.Victory, TextSize = 130 },
+	Defeat  = { From = 0.6, Peak = 1.1,  In = 0.25, Settle = 0.15, Color = COLORS.Defeat,  TextSize = 130 },
 }
 
 local UIController = {}
 
-local selfBar
-local rivalBar
-local koLabel
+-- Elementos
+local combatRoot       -- barras + marcador + temporizador (se oculta en Waiting)
+local leftBar
+local rightBar
+local timerLabel
+local banner           -- cartel principal
+local roundBanner      -- cartel de ronda
 local indicators = {}
-local selfConns = {}
-local rivalConns = {}
-local rivalModel = nil
-local rivalHum = nil
+local leftConns = {}
+local rightConns = {}
+
+-- Estado derivado del snapshot
+local snapshot = nil
+local leftFighter = nil
+local rightFighter = nil
+local amFighter = false
+local lastKey = nil
+local lastCountdownNumber = nil
+local fightBannerUntil = nil
+local refetchPending = false
+local refetchCount = 0
 
 ------------------------------------------------------------------
--- Utilidades de UI
+-- Utilidades
 ------------------------------------------------------------------
 local function make(className, props, parent)
 	local inst = Instance.new(className)
@@ -87,7 +121,6 @@ local function healthColor(ratio)
 	return COLORS.Low
 end
 
--- Remate = ultimo eslabon de su cadena (vale para combos futuros)
 local function isFinisher(action)
 	local cfg = CombatConfig.Actions[action]
 	return cfg ~= nil and cfg.ComboNext == nil
@@ -119,8 +152,37 @@ local function getHudParent()
 	}, parent)
 end
 
+-- Sacudida generica de un GuiObject alrededor de su posicion base
+local function shakeGui(holder, gui, level)
+	local params = SHAKE[level]
+	if not params then
+		return
+	end
+	holder.ShakeToken += 1
+	local token = holder.ShakeToken
+	local basePos = holder.BasePos
+
+	task.spawn(function()
+		local start = os.clock()
+		while holder.ShakeToken == token do
+			local t = os.clock() - start
+			if t >= params.Duration then
+				break
+			end
+			local decay = 1 - t / params.Duration
+			local ox = (math.random() * 2 - 1) * params.Amplitude * decay
+			local oy = (math.random() * 2 - 1) * params.Amplitude * 0.5 * decay
+			gui.Position = basePos + UDim2.fromOffset(ox, oy)
+			RunService.RenderStepped:Wait()
+		end
+		if holder.ShakeToken == token then
+			gui.Position = basePos
+		end
+	end)
+end
+
 ------------------------------------------------------------------
--- Barras de vida
+-- Barras de vida (polish v0.9.1) + marcador de rondas
 ------------------------------------------------------------------
 local function createBar(parent, side)
 	local isRight = side == "Right"
@@ -131,9 +193,9 @@ local function createBar(parent, side)
 		BackgroundTransparency = 1,
 		AnchorPoint = Vector2.new(isRight and 1 or 0, 0),
 		Position = basePos,
-		Size = UDim2.new(0.36, 0, 0, 58),
+		Size = UDim2.new(0.36, 0, 0, 78),
 	}, parent)
-	make("UISizeConstraint", { MaxSize = Vector2.new(460, 58) }, panel)
+	make("UISizeConstraint", { MaxSize = Vector2.new(460, 78) }, panel)
 
 	local nameLabel = make("TextLabel", {
 		Name = "PlayerName",
@@ -162,7 +224,6 @@ local function createBar(parent, side)
 	local anchor = Vector2.new(isRight and 1 or 0, 0)
 	local anchorPos = UDim2.fromScale(isRight and 1 or 0, 0)
 
-	-- Franja de dano retardado (debajo de la barra principal)
 	local trail = make("Frame", {
 		Name = "DamageTrail",
 		AnchorPoint = anchor,
@@ -219,7 +280,23 @@ local function createBar(parent, side)
 		ZIndex = 5,
 	}, back)
 
+	-- Marcador de rondas: propio "● ○" (llena desde fuera), rival "○ ●" (espejo)
+	local pipsFrame = make("Frame", {
+		Name = "RoundPips",
+		BackgroundTransparency = 1,
+		Position = UDim2.new(0, 0, 0, 60),
+		Size = UDim2.new(1, 0, 0, 16),
+	}, panel)
+	make("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		HorizontalAlignment = isRight and Enum.HorizontalAlignment.Right or Enum.HorizontalAlignment.Left,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 6),
+	}, pipsFrame)
+
 	return {
+		Side = side,
 		Panel = panel,
 		BasePos = basePos,
 		Fill = fill,
@@ -228,6 +305,7 @@ local function createBar(parent, side)
 		Name = nameLabel,
 		Value = valueLabel,
 		KO = koTag,
+		Pips = { Frame = pipsFrame, Dots = {} },
 		Ratio = 1,
 		FillTween = nil,
 		TrailTween = nil,
@@ -235,10 +313,11 @@ local function createBar(parent, side)
 		TrailToken = 0,
 		FlashTween = nil,
 		ShakeToken = 0,
+		BoundModel = nil,
+		BindToken = 0,
 	}
 end
 
--- K.O. y contador nunca se muestran a la vez
 local function setKO(bar, on)
 	bar.KO.Visible = on
 	bar.Value.Visible = not on
@@ -257,34 +336,6 @@ local function flashBar(bar, strong)
 	bar.FlashTween:Play()
 end
 
-local function shakePanel(bar, level)
-	local params = SHAKE[level]
-	if not params then
-		return
-	end
-	bar.ShakeToken += 1
-	local token = bar.ShakeToken
-
-	task.spawn(function()
-		local start = os.clock()
-		while bar.ShakeToken == token do
-			local t = os.clock() - start
-			if t >= params.Duration then
-				break
-			end
-			local decay = 1 - t / params.Duration
-			local ox = (math.random() * 2 - 1) * params.Amplitude * decay
-			local oy = (math.random() * 2 - 1) * params.Amplitude * 0.5 * decay
-			bar.Panel.Position = bar.BasePos + UDim2.fromOffset(ox, oy)
-			RunService.RenderStepped:Wait()
-		end
-		if bar.ShakeToken == token then
-			bar.Panel.Position = bar.BasePos
-		end
-	end)
-end
-
--- Detiene la franja y la deja en 'ratio' (sin animacion)
 local function snapTrail(bar, ratio)
 	bar.TrailToken += 1
 	if bar.TrailTween then
@@ -294,7 +345,6 @@ local function snapTrail(bar, ratio)
 	bar.Trail.Size = UDim2.fromScale(ratio, 1)
 end
 
--- instant = true: sin animacion (al enlazar un personaje nuevo)
 local function setBar(bar, hp, maxHp, instant)
 	local ratio = 0
 	if maxHp > 0 then
@@ -324,10 +374,7 @@ local function setBar(bar, hp, maxHp, instant)
 	bar.FillTween:Play()
 
 	if ratio < previous then
-		-- DANO. La franja representa SIEMPRE la vida al inicio de la secuencia actual:
-		--   * esperando (combo en curso): no se toca -> acumula el dano del combo;
-		--   * consumiendose (secuencia terminada): vuelve EXACTAMENTE a 'previous';
-		--   * en reposo: ya coincide con 'previous'.
+		-- La franja representa la vida al inicio de la secuencia de golpes actual
 		if bar.TrailDraining then
 			snapTrail(bar, previous)
 		end
@@ -355,9 +402,181 @@ local function setBar(bar, hp, maxHp, instant)
 
 		flashBar(bar, (previous - ratio) >= HUD_CFG.StrongHitRatio)
 	else
-		-- CURACION o sin cambio: la franja acompana sin retraso
 		snapTrail(bar, ratio)
 	end
+end
+
+local function setPips(bar, wins, total)
+	local pips = bar.Pips
+	if #pips.Dots ~= total then
+		for _, dot in pips.Dots do
+			dot:Destroy()
+		end
+		table.clear(pips.Dots)
+		for i = 1, total do
+			local dot = make("Frame", {
+				Name = "Pip" .. i,
+				Size = UDim2.fromOffset(14, 14),
+				BackgroundColor3 = COLORS.Pip,
+				BorderSizePixel = 0,
+				LayoutOrder = i,
+			}, pips.Frame)
+			make("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
+			make("UIStroke", { Color = COLORS.Pip, Thickness = 2 }, dot)
+			table.insert(pips.Dots, dot)
+		end
+	end
+	for i, dot in pips.Dots do
+		local filled
+		if bar.Side == "Left" then
+			filled = i <= wins
+		else
+			filled = i > total - wins
+		end
+		dot.BackgroundTransparency = filled and 0 or 1
+	end
+end
+
+-- Enlaza la barra al Humanoid del Model del fighter (desconecta el anterior).
+local function bindBar(bar, conns, model)
+	disconnectAll(conns)
+	bar.BindToken += 1
+	local token = bar.BindToken
+	bar.BoundModel = model
+	setKO(bar, false)
+
+	if not model then
+		bar.Value.Text = ""
+		return
+	end
+
+	task.spawn(function()
+		local hum = model:FindFirstChildOfClass("Humanoid")
+		if not hum then
+			local found = model:WaitForChild("Humanoid", 5)
+			if found and found:IsA("Humanoid") then
+				hum = found
+			end
+		end
+		if bar.BindToken ~= token or not hum then
+			return
+		end
+
+		setBar(bar, hum.Health, hum.MaxHealth, true)
+		setKO(bar, hum.Health <= 0)
+
+		table.insert(conns, hum.HealthChanged:Connect(function(hp)
+			setBar(bar, hp, hum.MaxHealth, false)
+		end))
+		table.insert(conns, hum:GetPropertyChangedSignal("MaxHealth"):Connect(function()
+			setBar(bar, hum.Health, hum.MaxHealth, false)
+		end))
+		table.insert(conns, hum.Died:Connect(function()
+			setKO(bar, true)
+		end))
+	end)
+end
+
+-- Solo re-enlaza si el Model cambio (un snapshot repetido no reinicia la franja)
+local function syncBar(bar, conns, fighter)
+	bar.Name.Text = fighter.Name or "-"
+	if bar.BoundModel ~= fighter.Model then
+		bindBar(bar, conns, fighter.Model)
+	end
+end
+
+------------------------------------------------------------------
+-- Carteles
+------------------------------------------------------------------
+local function createBanner(parent, name, yScale, height)
+	local label = make("TextLabel", {
+		Name = name,
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, yScale),
+		Size = UDim2.new(0, 900, 0, height),
+		Font = Enum.Font.GothamBlack,
+		TextSize = 96,
+		TextColor3 = COLORS.Text,
+		TextStrokeColor3 = Color3.new(0, 0, 0),
+		TextTransparency = 1,
+		TextStrokeTransparency = 1,
+		Text = "",
+		Visible = false,
+		ZIndex = 20,
+	}, parent)
+	local scale = make("UIScale", { Scale = 1 }, label)
+	return {
+		Label = label,
+		Scale = scale,
+		BasePos = label.Position,
+		Tweens = {},
+		ShakeToken = 0,
+	}
+end
+
+local function cancelTweens(b)
+	for _, t in b.Tweens do
+		t:Cancel()
+	end
+	table.clear(b.Tweens)
+end
+
+local function playTween(b, inst, info, props)
+	local t = TweenService:Create(inst, info, props)
+	table.insert(b.Tweens, t)
+	t:Play()
+	return t
+end
+
+local function showBanner(b, text, styleName)
+	local st = STYLES[styleName]
+	cancelTweens(b)
+	b.ShakeToken += 1
+	b.Label.Position = b.BasePos
+	b.Label.Text = text
+	b.Label.TextColor3 = st.Color
+	b.Label.TextSize = st.TextSize
+	b.Label.Visible = true
+	b.Label.TextTransparency = 1
+	b.Label.TextStrokeTransparency = 1
+	b.Scale.Scale = st.From
+
+	playTween(b, b.Label, TweenInfo.new(st.In, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		TextTransparency = 0,
+		TextStrokeTransparency = 0,
+	})
+	local grow = playTween(b, b.Scale, TweenInfo.new(st.In, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Scale = st.Peak or 1,
+	})
+	if st.Peak then
+		grow.Completed:Connect(function(state)
+			if state == Enum.PlaybackState.Completed then
+				playTween(b, b.Scale, TweenInfo.new(st.Settle, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+					Scale = 1,
+				})
+			end
+		end)
+	end
+	if st.Shake then
+		shakeGui(b, b.Label, st.Shake)
+	end
+end
+
+local function hideBanner(b, fade)
+	cancelTweens(b)
+	if not b.Label.Visible then
+		return
+	end
+	local t = playTween(b, b.Label, TweenInfo.new(fade or 0.2), {
+		TextTransparency = 1,
+		TextStrokeTransparency = 1,
+	})
+	t.Completed:Connect(function(state)
+		if state == Enum.PlaybackState.Completed then
+			b.Label.Visible = false
+		end
+	end)
 end
 
 ------------------------------------------------------------------
@@ -457,137 +676,172 @@ local function startCooldown(indicator, duration)
 end
 
 ------------------------------------------------------------------
--- Jugador propio
+-- Snapshot -> HUD
 ------------------------------------------------------------------
-local function bindSelf(character)
-	disconnectAll(selfConns)
-	koLabel.Visible = false
-	setKO(selfBar, false)
-
-	local hum = character:WaitForChild("Humanoid", 10)
-	if not (hum and hum:IsA("Humanoid")) then
-		return
+-- Propio a la izquierda y rival a la derecha. Si no soy fighter: A izquierda, B derecha.
+local function resolveFighters(snap)
+	local fighters = snap.Fighters
+	local A = fighters and fighters.A
+	local B = fighters and fighters.B
+	if not (A and B) then
+		return nil, nil, false
 	end
-
-	selfBar.Name.Text = LocalPlayer.DisplayName
-	setBar(selfBar, hum.Health, hum.MaxHealth, true)
-
-	table.insert(selfConns, hum.HealthChanged:Connect(function(hp)
-		setBar(selfBar, hp, hum.MaxHealth, false)
-	end))
-	table.insert(selfConns, hum:GetPropertyChangedSignal("MaxHealth"):Connect(function()
-		setBar(selfBar, hum.Health, hum.MaxHealth, false)
-	end))
-	table.insert(selfConns, hum.Died:Connect(function()
-		setKO(selfBar, true)
-		koLabel.Visible = true
-	end))
+	if A.Player == LocalPlayer then
+		return A, B, true
+	end
+	if B.Player == LocalPlayer then
+		return B, A, true
+	end
+	return A, B, false
 end
 
-------------------------------------------------------------------
--- Rival
-------------------------------------------------------------------
-local bindRival
+local applySnapshot
 
-bindRival = function(model)
-	disconnectAll(rivalConns)
-	rivalModel = model
-	rivalHum = model and model:FindFirstChildOfClass("Humanoid") or nil
-
-	if not (model and rivalHum) then
-		rivalModel = nil
-		rivalHum = nil
-		rivalBar.Panel.Visible = false
+local function scheduleRefetch()
+	if refetchPending or refetchCount >= HUD_CFG.MaxRefetch then
 		return
 	end
-
-	rivalBar.Panel.Visible = true
-	setKO(rivalBar, false)
-
-	local rivalPlayer = Players:GetPlayerFromCharacter(model)
-	rivalBar.Name.Text = rivalPlayer and rivalPlayer.DisplayName or model.Name
-
-	local hum = rivalHum
-	setBar(rivalBar, hum.Health, hum.MaxHealth, true)
-
-	table.insert(rivalConns, hum.HealthChanged:Connect(function(hp)
-		setBar(rivalBar, hp, hum.MaxHealth, false)
-	end))
-	table.insert(rivalConns, hum:GetPropertyChangedSignal("MaxHealth"):Connect(function()
-		setBar(rivalBar, hum.Health, hum.MaxHealth, false)
-	end))
-	table.insert(rivalConns, hum.Died:Connect(function()
-		setKO(rivalBar, true)
-		task.delay(HUD_CFG.KODisplay, function()
-			if rivalModel == model then
-				bindRival(nil)
-			end
+	refetchPending = true
+	refetchCount += 1
+	task.delay(HUD_CFG.RefetchDelay, function()
+		refetchPending = false
+		local ok, snap = pcall(function()
+			return GetMatchState:InvokeServer()
 		end)
-	end))
-	table.insert(rivalConns, model.AncestryChanged:Connect(function()
-		if not model:IsDescendantOf(workspace) and rivalModel == model then
-			bindRival(nil)
+		if ok and snap then
+			applySnapshot(snap)
 		end
-	end))
+	end)
 end
 
-local scanParams = OverlapParams.new()
-scanParams.FilterType = Enum.RaycastFilterType.Exclude
+local function onStateEnter(snap)
+	lastCountdownNumber = nil
+	fightBannerUntil = nil
+	refetchCount = 0
 
-local function scanRival()
-	local character = LocalPlayer.Character
-	local root = character and character:FindFirstChild("HumanoidRootPart")
-	if not root then
-		return
-	end
-	if rivalHum and rivalHum.Health <= 0 then
-		return
-	end
+	local state = snap.State
+	if state == "Waiting" then
+		hideBanner(banner, 0.3)
+		hideBanner(roundBanner, 0.3)
 
-	scanParams.FilterDescendantsInstances = { character }
+	elseif state == "Countdown" then
+		-- ROUND N durante toda la cuenta atras; los numeros los pone renderTick
+		showBanner(roundBanner, ("ROUND %d"):format(snap.Round or 1), "Round")
+		hideBanner(banner, 0.1)
 
-	local best = nil
-	local bestDist = math.huge
-	local seen = {}
-	for _, part in workspace:GetPartBoundsInRadius(root.Position, HUD_CFG.RivalRange, scanParams) do
-		local model = part:FindFirstAncestorWhichIsA("Model")
-		if model and not seen[model] then
-			seen[model] = true
-			local hum = model:FindFirstChildOfClass("Humanoid")
-			local mRoot = model:FindFirstChild("HumanoidRootPart")
-			if hum and mRoot and hum.Health > 0 then
-				local dist = (mRoot.Position - root.Position).Magnitude
-				if dist < bestDist then
-					best = model
-					bestDist = dist
-				end
+	elseif state == "Fighting" then
+		hideBanner(roundBanner, 0.2)
+		showBanner(banner, "FIGHT!", "Fight")
+		fightBannerUntil = os.clock() + HUD_CFG.FightBannerTime
+
+	elseif state == "RoundEnd" then
+		hideBanner(roundBanner, 0.1)
+		local result = snap.RoundResult
+		local reason = result and result.Reason
+		local style = if reason == "KO" or reason == "DoubleKO" then "Impact" else "Result"
+		showBanner(banner, REASON_TEXT[reason] or "", style)
+
+	elseif state == "MatchEnd" then
+		hideBanner(roundBanner, 0.1)
+		-- El servidor decide el ganador; la UI no compara vidas
+		local result = snap.MatchResult
+		local winnerId = result and result.WinnerId
+		if not winnerId then
+			showBanner(banner, "DRAW", "Result")
+		elseif amFighter and leftFighter then
+			if winnerId == leftFighter.Id then
+				showBanner(banner, "VICTORY", "Victory")
+			else
+				showBanner(banner, "DEFEAT", "Defeat")
 			end
+		else
+			local winner = nil
+			if leftFighter and leftFighter.Id == winnerId then
+				winner = leftFighter
+			elseif rightFighter and rightFighter.Id == winnerId then
+				winner = rightFighter
+			end
+			showBanner(banner, string.upper((winner and winner.Name) or "?") .. " WINS", "Result")
+		end
+	end
+end
+
+applySnapshot = function(snap)
+	if typeof(snap) ~= "table" then
+		return
+	end
+	snapshot = snap
+	local left, right, isFighter = resolveFighters(snap)
+	leftFighter = left
+	rightFighter = right
+	amFighter = isFighter
+
+	if snap.State == "Waiting" or not (left and right) then
+		-- Sin partida real: HUD de combate oculto
+		combatRoot.Visible = false
+		if leftBar.BoundModel then
+			bindBar(leftBar, leftConns, nil)
+		end
+		if rightBar.BoundModel then
+			bindBar(rightBar, rightConns, nil)
+		end
+	else
+		combatRoot.Visible = true
+		syncBar(leftBar, leftConns, left)
+		syncBar(rightBar, rightConns, right)
+		local total = snap.RoundsToWin or 2
+		setPips(leftBar, left.RoundWins or 0, total)
+		setPips(rightBar, right.RoundWins or 0, total)
+
+		-- Un Model sin replicar llega como nil: se vuelve a pedir el snapshot
+		if not (left.Model and right.Model) then
+			scheduleRefetch()
 		end
 	end
 
-	local currentDist = math.huge
-	if rivalModel and rivalHum and rivalHum.Health > 0 then
-		local cRoot = rivalModel:FindFirstChild("HumanoidRootPart")
-		if cRoot then
-			currentDist = (cRoot.Position - root.Position).Magnitude
-		end
+	local key = ("%s:%s:%s"):format(tostring(snap.MatchId), tostring(snap.State), tostring(snap.Round))
+	if key ~= lastKey then
+		lastKey = key
+		onStateEnter(snap)
+	end
+end
+
+-- Temporizador y cuenta atras: recalculados cada frame a partir del reloj del servidor
+local function renderTick()
+	local snap = snapshot
+	if not snap or snap.State == "Waiting" then
+		timerLabel.Visible = false
+		return
 	end
 
-	if currentDist > HUD_CFG.RivalRange then
-		if best ~= rivalModel then
-			bindRival(best)
+	local remaining = 0
+	if snap.StateEndsAt then
+		remaining = math.max(0, snap.StateEndsAt - workspace:GetServerTimeNow())
+	end
+
+	if snap.State == "Fighting" then
+		timerLabel.Visible = true
+		timerLabel.Text = ("%02d"):format(math.ceil(remaining))
+		if fightBannerUntil and os.clock() >= fightBannerUntil then
+			fightBannerUntil = nil
+			hideBanner(banner, 0.25)
 		end
-	elseif best and best ~= rivalModel and bestDist < currentDist * HUD_CFG.RivalSwitchRatio then
-		bindRival(best)
+	else
+		timerLabel.Visible = false
+	end
+
+	if snap.State == "Countdown" then
+		local n = math.max(1, math.ceil(remaining))
+		if n ~= lastCountdownNumber then
+			lastCountdownNumber = n
+			showBanner(banner, tostring(n), "Count")
+		end
 	end
 end
 
 ------------------------------------------------------------------
 -- Eventos de combate (solo representacion)
--- Formato verificado contra CombatService v0.8:
---   HitConfirmed: Victim = nombre del modelo (string)
---   HitReceived:  Attacker = Player
---   GuardBroken:  Victim = nombre del modelo (string), Attacker = Player
+-- HitConfirmed/GuardBroken.Victim = nombre del modelo; HitReceived/GuardBroken.Attacker = Player
 ------------------------------------------------------------------
 local function onCombatEvent(data)
 	if typeof(data) ~= "table" then
@@ -598,22 +852,30 @@ local function onCombatEvent(data)
 		if data.Target == LocalPlayer then
 			startCooldown(indicators.Dash, CombatConfig.Dash.Cooldown)
 		end
+		return
+	end
 
-	elseif data.Type == "HitConfirmed" then
+	-- Sacudidas: solo si soy fighter (el panel izquierdo es el mio)
+	if not amFighter then
+		return
+	end
+	local rivalModel = rightFighter and rightFighter.Model
+
+	if data.Type == "HitConfirmed" then
 		if rivalModel and data.Victim == rivalModel.Name then
-			shakePanel(rivalBar, isFinisher(data.Action) and "Heavy" or "Light")
+			shakeGui(rightBar, rightBar.Panel, isFinisher(data.Action) and "Heavy" or "Light")
 		end
 
 	elseif data.Type == "HitReceived" then
-		shakePanel(selfBar, isFinisher(data.Action) and "Heavy" or "Light")
+		shakeGui(leftBar, leftBar.Panel, isFinisher(data.Action) and "Heavy" or "Light")
 
 	elseif data.Type == "GuardBroken" then
 		if data.Attacker == LocalPlayer then
 			if rivalModel and data.Victim == rivalModel.Name then
-				shakePanel(rivalBar, "Break")
+				shakeGui(rightBar, rightBar.Panel, "Break")
 			end
 		else
-			shakePanel(selfBar, "Break")
+			shakeGui(leftBar, leftBar.Panel, "Break")
 		end
 	end
 end
@@ -627,24 +889,32 @@ end
 function UIController:Start()
 	local hud = getHudParent()
 
-	selfBar = createBar(hud, "Left")
-	rivalBar = createBar(hud, "Right")
-	rivalBar.Panel.Visible = false
-
-	koLabel = make("TextLabel", {
-		Name = "KOBanner",
+	combatRoot = make("Frame", {
+		Name = "Match",
 		BackgroundTransparency = 1,
-		AnchorPoint = Vector2.new(0.5, 0.5),
-		Position = UDim2.fromScale(0.5, 0.4),
-		Size = UDim2.new(0, 400, 0, 120),
-		Font = Enum.Font.GothamBlack,
-		TextSize = 96,
-		TextColor3 = COLORS.KO,
-		TextStrokeTransparency = 0,
-		Text = "K.O.",
+		Size = UDim2.fromScale(1, 1),
 		Visible = false,
-		ZIndex = 10,
 	}, hud)
+
+	leftBar = createBar(combatRoot, "Left")
+	rightBar = createBar(combatRoot, "Right")
+
+	timerLabel = make("TextLabel", {
+		Name = "Timer",
+		BackgroundTransparency = 1,
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, HUD_CFG.TopOffset),
+		Size = UDim2.new(0, 120, 0, 54),
+		Font = Enum.Font.GothamBlack,
+		TextSize = 44,
+		TextColor3 = COLORS.Text,
+		TextStrokeTransparency = 0,
+		Text = "99",
+		Visible = false,
+	}, combatRoot)
+
+	roundBanner = createBanner(hud, "RoundBanner", 0.3, 60)
+	banner = createBanner(hud, "MainBanner", 0.42, 150)
 
 	local indicatorBar = make("Frame", {
 		Name = "Indicators",
@@ -659,27 +929,23 @@ function UIController:Start()
 		VerticalAlignment = Enum.VerticalAlignment.Center,
 		Padding = UDim.new(0, 8),
 	}, indicatorBar)
-
 	indicators.Dash = createIndicator(indicatorBar, "DASH")
 
-	LocalPlayer.CharacterAdded:Connect(bindSelf)
-	if LocalPlayer.Character then
-		task.spawn(bindSelf, LocalPlayer.Character)
-	end
-
 	CombatEvent.OnClientEvent:Connect(onCombatEvent)
+	MatchStateChanged.OnClientEvent:Connect(applySnapshot)
+	RunService.RenderStepped:Connect(renderTick)
 
+	-- Entrada tardia: pedir el estado actual
 	task.spawn(function()
-		while true do
-			task.wait(HUD_CFG.RivalScanInterval)
-			local ok, err = pcall(scanRival)
-			if not ok then
-				SharedUtil.Warn("UI", "scanRival: " .. tostring(err))
-			end
+		local ok, snap = pcall(function()
+			return GetMatchState:InvokeServer()
+		end)
+		if ok and snap and not snapshot then
+			applySnapshot(snap)
 		end
 	end)
 
-	SharedUtil.Log("UI", "Combat HUD v0.9.1 listo")
+	SharedUtil.Log("UI", "Match HUD v1.0b listo")
 end
 
 return UIController
