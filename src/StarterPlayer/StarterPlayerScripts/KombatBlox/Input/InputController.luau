@@ -12,6 +12,8 @@ local BINDINGS: {[EnumItem]: string} = {
 	[Enum.KeyCode.ButtonX] = "LightAttack",              -- Xbox
 	[Enum.KeyCode.Q] = "Dash",                           -- PC
 	[Enum.KeyCode.ButtonB] = "Dash",                     -- Xbox
+	[Enum.KeyCode.T] = "LockToggle",                     -- PC: alterna lock-on de camara
+	[Enum.KeyCode.ButtonSelect] = "LockToggle",          -- Xbox: boton View
 }
 
 -- Mantener: "<Accion>Start" al pulsar y "<Accion>End" al soltar

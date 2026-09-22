@@ -364,6 +364,11 @@ end
 -- Envio de acciones
 ------------------------------------------------------------------
 local function requestAction(action: string)
+	-- Acciones no-combate (p.ej. LockToggle de camara) no van al servidor: ignorar sin warn.
+	if action == "LockToggle" then
+		return
+	end
+
 	-- Block: se envia SIEMPRE, sin filtro anti-spam (soltar nunca debe perderse).
 	if action == "BlockStart" or action == "BlockEnd" then
 		RequestAction:FireServer(action)
