@@ -228,21 +228,37 @@ local function stripForceField(character)
 end
 
 local function setMovementLocked(f, locked)
-	if f.Kind ~= "Player" then
-		return
-	end
 	local hum = f.Humanoid
 	if not (hum and hum.Parent) then
 		return
 	end
+
+	if f.Kind == "Player" then
+		if locked then
+			hum.WalkSpeed = 0
+			hum.JumpPower = 0
+			hum.JumpHeight = 0
+		else
+			hum.WalkSpeed = StarterPlayer.CharacterWalkSpeed
+			hum.JumpPower = StarterPlayer.CharacterJumpPower
+			hum.JumpHeight = StarterPlayer.CharacterJumpHeight
+		end
+		return
+	end
+
+	-- NPC: locked = anclado y quieto (Countdown/RoundEnd); unlocked = fisica + locomocion.
+	-- La IA (AIService/DummyBrain) solo mueve al NPC cuando esta unlocked (durante Fighting).
+	local root = f.Root
 	if locked then
 		hum.WalkSpeed = 0
-		hum.JumpPower = 0
-		hum.JumpHeight = 0
+		if root then
+			root.Anchored = true
+		end
 	else
+		if root then
+			root.Anchored = false
+		end
 		hum.WalkSpeed = StarterPlayer.CharacterWalkSpeed
-		hum.JumpPower = StarterPlayer.CharacterJumpPower
-		hum.JumpHeight = StarterPlayer.CharacterJumpHeight
 	end
 end
 
@@ -717,6 +733,26 @@ function MatchService.CanReceiveDamage(model)
 	local f = fighterByModel(model)
 	if not f then
 		return true
+	end
+	return match.State == STATE.Fighting
+end
+
+-- Autoridad de daño v1.1 (seguridad PvP): valida atacante Y victima por Model.
+-- Solo hay daño si atacante y victima son los DOS Fighters (distintos) del match
+-- actual y el combate esta en Fighting. Sirve para Player<->Player, Player<->NPC y
+-- NPC<->Player. Fuera de match (combate libre en pruebas) devuelve true.
+-- Rechaza por construccion a cualquier tercero (Player C, NPC ajeno, self-hit).
+function MatchService.CanHit(attackerModel, victimModel)
+	if not match then
+		return true
+	end
+	local af = fighterByModel(attackerModel)
+	local vf = fighterByModel(victimModel)
+	if not (af and vf) then
+		return false
+	end
+	if af.Id == vf.Id then
+		return false
 	end
 	return match.State == STATE.Fighting
 end
