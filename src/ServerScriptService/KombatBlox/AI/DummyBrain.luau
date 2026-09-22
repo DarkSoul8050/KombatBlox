@@ -5,14 +5,13 @@
 -- Respeta el estado real del combate via CombatService.GetActorState(model):
 -- solo decide cuando esta Idle; Attacking/Hitstun/Stunned/Dashing lo congelan solos.
 --
--- v1.2 polish:
---   * Giro suave con AlignOrientation (sin jitter; independiente del DecisionInterval).
---   * Histeresis Approach/Engage (no flip-flop en el borde del rango).
---   * StopDistance al acercarse (no empuja al jugador).
---   * Reposition tras combo (no solo spamea M1).
---   * Bloqueo sostenido y natural (BlockMinHold).
---   * Sesgo defensivo tras recibir golpe (PostHitBias).
---   * Sigue 100% apoyado en CombatService (sin segunda autoridad de combate).
+-- v1.2 polish + smarts:
+--   * Giro suave con AlignOrientation (sin jitter).
+--   * Histeresis Approach/Engage (no flip-flop). StopDistance (no empuja).
+--   * PUNISH: si el rival termina/falla un ataque, contraataca en esa apertura
+--     (incluye dash de acercamiento). Solo lee estado publico -> sin trampas.
+--   * Bloqueo sostenido + presion tras bloquear. Reposition con STRAFE (rodea).
+--   * Sesgo defensivo tras recibir golpe. 100% apoyado en CombatService.
 
 local DummyBrain = {}
 DummyBrain.__index = DummyBrain
@@ -29,7 +28,7 @@ function DummyBrain.new(model: Model, deps: Deps)
 	self.P = deps.Profile
 
 	self.mode = "Approach"       -- "Approach" | "Engage" (con histeresis)
-	self.comboStep = 0           -- 0 = sin combo; 1..4 = eslabon lanzado
+	self.comboStep = 0
 	self.lastAttackAt = 0
 	self.blocking = false
 	self.blockUntil = 0
@@ -37,7 +36,11 @@ function DummyBrain.new(model: Model, deps: Deps)
 	self.nextReactAt = 0
 	self.repositionUntil = 0
 	self.postHitUntil = 0
+	self.punishUntil = 0
 	self.prevState = "Idle"
+	self.rivalPrevState = "Idle"
+	self.strafeSign = 1
+	self.nextStrafeFlip = 0
 	self.lastMoveTarget = nil :: Vector3?
 
 	self.align = nil :: AlignOrientation?
@@ -49,12 +52,11 @@ local function flat(v: Vector3): Vector3
 	return Vector3.new(v.X, 0, v.Z)
 end
 
--- Crea (una vez) la AlignOrientation que gira el NPC de forma suave hacia el rival.
 function DummyBrain:_ensureAlign(root: BasePart, hum: Humanoid)
 	if self.align and self.align.Parent then
 		return
 	end
-	hum.AutoRotate = false   -- el giro lo controla AlignOrientation, no la locomocion
+	hum.AutoRotate = false
 
 	local att = Instance.new("Attachment")
 	att.Name = "KB_AIAlign"
@@ -67,14 +69,13 @@ function DummyBrain:_ensureAlign(root: BasePart, hum: Humanoid)
 	align.RigidityEnabled = false
 	align.Responsiveness = self.P.TurnResponsiveness
 	align.MaxTorque = 1e6
-	align.PrimaryAxisOnly = true         -- solo yaw (no vuelca el cuerpo)
+	align.PrimaryAxisOnly = true
 	align.Parent = root
 
 	self.alignAtt = att
 	self.align = align
 end
 
--- Actualiza el objetivo de giro (yaw) hacia una posicion. Suave, cada tick.
 function DummyBrain:_faceTowards(root: BasePart, targetPos: Vector3)
 	local align = self.align
 	if not align then
@@ -117,10 +118,17 @@ function DummyBrain:_moveTo(hum: Humanoid, root: BasePart, targetPos: Vector3)
 	local target = Vector3.new(targetPos.X, root.Position.Y, targetPos.Z)
 	local last = self.lastMoveTarget
 	if last and (last - target).Magnitude < 0.75 then
-		return   -- evita re-emitir MoveTo casi identico (anti-stutter)
+		return
 	end
 	self.lastMoveTarget = target
 	hum:MoveTo(target)
+end
+
+function DummyBrain:_attack(model: Model, now: number)
+	self.comboStep = 1
+	self.lastAttackAt = now
+	self.punishUntil = 0
+	self.Combat.PerformAction(model, "LightAttack")
 end
 
 -- Llamada por AIService en cada tick de decision (solo durante Fighting).
@@ -139,12 +147,11 @@ function DummyBrain:Update(rivalModel: Model?)
 	local myState = Combat.GetActorState(model)
 	local now = os.clock()
 
-	-- Giro suave SIEMPRE hacia el rival (aunque este en otro estado).
 	if rivalRoot then
 		self:_faceTowards(root, rivalRoot.Position)
 	end
 
-	-- Deteccion de salida de hitstun/stun -> sesgo defensivo un instante.
+	-- Salida de hitstun/stun -> sesgo defensivo un instante.
 	if (self.prevState == "Hitstun" or self.prevState == "Stunned")
 		and myState ~= "Hitstun" and myState ~= "Stunned"
 	then
@@ -153,18 +160,26 @@ function DummyBrain:Update(rivalModel: Model?)
 	end
 	self.prevState = myState
 
-	-- Guardia en curso: mantener minimo, soltar cuando el rival deja de amenazar.
+	-- Seguimiento del rival: si acaba de terminar/fallar un ataque, abrir ventana de castigo.
+	local rivalState = if rivalModel then Combat.GetActorState(rivalModel) else "Idle"
+	if self.rivalPrevState == "Attacking" and rivalState ~= "Attacking" then
+		self.punishUntil = now + P.PunishWindow
+	end
+	self.rivalPrevState = rivalState
+
+	-- Guardia en curso.
 	if self.blocking then
-		local rivalThreat = rivalModel and Combat.GetActorState(rivalModel) == "Attacking"
+		local rivalThreat = rivalState == "Attacking"
 		local heldEnough = now - self.blockSince >= P.BlockMinHold
 		if myState ~= "Blocking" or now >= self.blockUntil or (heldEnough and not rivalThreat) then
 			self:_releaseBlock()
+			-- Tras bloquear, presiona: abre ventana de castigo.
+			self.punishUntil = now + P.PunishWindow
 		else
 			return
 		end
 	end
 
-	-- Estados que congelan la decision (respeta el combate real).
 	if myState ~= "Idle" then
 		return
 	end
@@ -177,15 +192,10 @@ function DummyBrain:Update(rivalModel: Model?)
 		self.comboStep = 0
 	end
 
-	local dist = (flat(rivalRoot.Position - root.Position)).Magnitude
-
-	-- Reposicion activa: retroceder/spacing durante un momento.
-	if now < self.repositionUntil then
-		local away = flat(root.Position - rivalRoot.Position)
-		away = if away.Magnitude > 0.05 then away.Unit else -root.CFrame.LookVector
-		self:_moveTo(hum, root, root.Position + away * 3)
-		return
-	end
+	local toRival = flat(rivalRoot.Position - root.Position)
+	local dist = toRival.Magnitude
+	local dir = if dist > 0.05 then toRival.Unit else root.CFrame.LookVector
+	local defensive = now < self.postHitUntil
 
 	if dist > P.DetectionRange then
 		stopMove(hum)
@@ -199,13 +209,10 @@ function DummyBrain:Update(rivalModel: Model?)
 		self.mode = "Engage"
 	end
 
-	local defensive = now < self.postHitUntil
-
-	-- Reaccion defensiva: bloquear si el rival ataca en rango (mas probable si postHit).
+	-- 1) Defensa: bloquear si el rival ataca en rango (mas probable si acabo de comer un golpe).
 	if now >= self.nextReactAt
 		and dist <= P.BlockReactRange
-		and rivalModel
-		and Combat.GetActorState(rivalModel) == "Attacking"
+		and rivalState == "Attacking"
 	then
 		self.nextReactAt = now + math.max(P.ReactionDelay, P.MinReactionDelay)
 		local chance = if defensive then math.min(1, P.BlockChance + 0.35) else P.BlockChance
@@ -218,20 +225,48 @@ function DummyBrain:Update(rivalModel: Model?)
 		end
 	end
 
-	-- Tras un golpe: preferir reposicionar antes que atacar.
+	-- 2) Recien golpeado: preferir espaciar antes que atacar.
 	if defensive and self.mode == "Engage" then
 		self.repositionUntil = now + P.RepositionTime
+		self.punishUntil = 0
+	end
+
+	-- 3) Castigo: el rival dejo una apertura. Golpear ya, o dashear para llegar.
+	if now < self.punishUntil and not defensive then
+		if self.mode == "Engage" then
+			stopMove(hum)
+			self:_attack(model, now)
+			return
+		elseif dist <= P.DashGapMin then
+			self.punishUntil = 0
+			Combat.PerformAction(model, "Dash", dir)
+			return
+		end
+	end
+
+	-- 4) Reposicion activa: rodear (strafe) o retroceder.
+	if now < self.repositionUntil then
+		local away = if toRival.Magnitude > 0.05 then -dir else -root.CFrame.LookVector
+		local move = away * 0.6
+		if math.random() < P.StrafeChance or now < self.nextStrafeFlip then
+			if now >= self.nextStrafeFlip then
+				self.nextStrafeFlip = now + 0.5
+				self.strafeSign = if math.random() < 0.5 then 1 else -1
+			end
+			local lateral = Vector3.new(-away.Z, 0, away.X) * self.strafeSign
+			move = away * 0.4 + lateral * 0.9
+		end
+		self:_moveTo(hum, root, root.Position + move * 3)
 		return
 	end
 
+	-- 5) En rango: pelear (combo M1 con continuacion probabilistica).
 	if self.mode == "Engage" then
 		stopMove(hum)
 
 		local step = self.comboStep
 		if step == 0 then
-			self.comboStep = 1
-			self.lastAttackAt = now
-			Combat.PerformAction(model, "LightAttack")
+			self:_attack(model, now)
 		elseif step < 4 then
 			local chance = P.ComboContinuationChance[step] or 0.8
 			if math.random() < chance then
@@ -253,20 +288,15 @@ function DummyBrain:Update(rivalModel: Model?)
 		return
 	end
 
-	-- Approach: cerrar hueco (dash a veces) hasta StopDistance (sin empujar).
+	-- 6) Approach: cerrar hueco (dash a veces) hasta StopDistance.
 	self.comboStep = 0
-	local toRival = flat(rivalRoot.Position - root.Position)
-	local dir = if toRival.Magnitude > 0.05 then toRival.Unit else root.CFrame.LookVector
-
 	if dist >= P.DashGapMin and math.random() < P.DashChance then
 		Combat.PerformAction(model, "Dash", dir)
 		return
 	end
-
 	self:_moveTo(hum, root, rivalRoot.Position - dir * P.StopDistance)
 end
 
--- Detiene al NPC, suelta guardia y limpia los constraints de la IA.
 function DummyBrain:Stop()
 	self:_releaseBlock()
 	local hum = self.Model and self.Model:FindFirstChildOfClass("Humanoid")

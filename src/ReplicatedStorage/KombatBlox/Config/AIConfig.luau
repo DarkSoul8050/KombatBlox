@@ -37,6 +37,9 @@ export type Profile = {
 	RepositionTime: number,     -- s de retroceso/spacing
 	PostHitBias: number,        -- s de sesgo defensivo al salir de hitstun/stun
 
+	PunishWindow: number,       -- s de ventana para castigar cuando el rival termina/falla un ataque
+	StrafeChance: number,       -- prob. de rodear (strafe) al reposicionar en vez de recto
+
 	FacePlayer: boolean,
 	TurnResponsiveness: number, -- AlignOrientation: mayor = giro mas firme
 }
@@ -67,6 +70,9 @@ local Easy: Profile = {
 	RepositionTime = 0.8,
 	PostHitBias = 0.50,
 
+	PunishWindow = 0.12,
+	StrafeChance = 0.10,
+
 	FacePlayer = true,
 	TurnResponsiveness = 25,
 }
@@ -77,9 +83,9 @@ local Normal: Profile = {
 	MinReactionDelay = 0.10,
 
 	DetectionRange = 80,
-	EngageRange = 6.0,
-	DisengageRange = 8.5,
-	StopDistance = 4.5,
+	EngageRange = 6.5,
+	DisengageRange = 9.0,
+	StopDistance = 4.0,
 	GiveUpChaseRange = 100,
 
 	ComboContinuationChance = { 0.90, 0.85, 0.80 },
@@ -90,12 +96,15 @@ local Normal: Profile = {
 	BlockMaxHold = 1.2,
 	BlockReactRange = 9.0,
 
-	DashChance = 0.15,
-	DashGapMin = 12,
+	DashChance = 0.22,
+	DashGapMin = 9,
 
-	RepositionChance = 0.40,
-	RepositionTime = 0.6,
+	RepositionChance = 0.35,
+	RepositionTime = 0.55,
 	PostHitBias = 0.30,
+
+	PunishWindow = 0.30,
+	StrafeChance = 0.25,
 
 	FacePlayer = true,
 	TurnResponsiveness = 40,
@@ -120,12 +129,15 @@ local Hard: Profile = {
 	BlockMaxHold = 1.4,
 	BlockReactRange = 10.0,
 
-	DashChance = 0.30,
-	DashGapMin = 10,
+	DashChance = 0.35,
+	DashGapMin = 9,
 
 	RepositionChance = 0.25,
-	RepositionTime = 0.5,
+	RepositionTime = 0.45,
 	PostHitBias = 0.15,
+
+	PunishWindow = 0.45,
+	StrafeChance = 0.40,
 
 	FacePlayer = true,
 	TurnResponsiveness = 60,
