@@ -15,6 +15,7 @@ local KeyframeSequenceProvider = game:GetService("KeyframeSequenceProvider")
 local KB = ReplicatedStorage:WaitForChild("KombatBlox")
 local SharedUtil = require(KB.Modules.SharedUtil)
 local CombatConfig = require(KB.Modules.CombatConfig)
+local FeelConfig = require(KB.Config.FeelConfig)
 local InputController = require(script.Parent.Parent.Input.InputController)
 local CameraController = require(script.Parent.Parent.Camera.CameraController)
 
@@ -209,18 +210,34 @@ function CombatController.CameraShake(intensity: number?, duration: number?)
 	)
 end
 
-function CombatController.Hitstop(track: AnimationTrack?)
-	local duration = CombatConfig.Hitstop
-	if not track or duration <= 0 then
+-- Hitstop client-only: congela brevemente el track del impacto para dar "peso".
+-- La duracion viene de FeelConfig (por accion). NUNCA toca el servidor.
+function CombatController.Hitstop(track: AnimationTrack?, duration: number?)
+	local d = duration or 0
+	if not track or d <= 0 then
 		return
 	end
 	task.spawn(function()
 		track:AdjustSpeed(0)
-		task.wait(duration)
+		task.wait(d)
 		if track.IsPlaying then
 			track:AdjustSpeed(1)
 		end
 	end)
+end
+
+-- Hitstop de una accion segun FeelConfig (M1_1..M1_4 / GuardBreak), opcionalmente recibido.
+local function hitstopFor(action: string?, isGuardBreak: boolean, received: boolean): number
+	local d = 0
+	if isGuardBreak then
+		d = FeelConfig.Hitstop.GuardBreak
+	elseif action then
+		d = FeelConfig.Hitstop.Actions[action] or 0
+	end
+	if received then
+		d *= FeelConfig.Hitstop.ReceivedMultiplier
+	end
+	return d
 end
 
 local function flash(character: Model, color: Color3)
@@ -453,13 +470,21 @@ local function onCombatEvent(data: any)
 		local cfg = CombatConfig.Actions[data.Action]
 		CombatController.SpawnHitVFX(data.HitPosition, COLOR_HIT)
 		CombatController.PlayHitSFX(cfg and cfg.HitSFX)
-		CombatController.CameraShake()
-		CombatController.Hitstop(attackTrack)
+		-- Peso por accion: finisher = shake fuerte + FOV punch; resto = shake leve.
+		local heavy = FeelConfig.FinisherActions[data.Action] == true
+		local shake = if heavy then FeelConfig.Shake.Heavy else FeelConfig.Shake.Light
+		CombatController.CameraShake(shake.Intensity, shake.Duration)
+		if heavy then
+			local f = FeelConfig.Fov.Heavy
+			CameraController.FovPunch(f.Delta, f.In, f.Out)
+		end
+		CombatController.Hitstop(attackTrack, hitstopFor(data.Action, false, false))
 
 	elseif data.Type == "HitBlocked" then
 		CombatController.SpawnHitVFX(data.HitPosition, COLOR_BLOCK, 2.2)
 		CombatController.PlayHitSFX(BLOCK.BlockSFX)
-		CombatController.CameraShake(0.15, 0.08)
+		local s = FeelConfig.Shake.Blocked
+		CombatController.CameraShake(s.Intensity, s.Duration)
 		if data.Attacker ~= LocalPlayer then
 			local character = LocalPlayer.Character
 			if character then
@@ -471,7 +496,13 @@ local function onCombatEvent(data: any)
 		SharedUtil.Log("Combat", "GUARD BREAK")
 		CombatController.SpawnHitVFX(data.HitPosition, COLOR_BREAK, 3)
 		CombatController.PlayHitSFX(BLOCK.GuardBreakSFX)
-		CombatController.CameraShake(0.8, 0.2)
+		local s = FeelConfig.Shake.Break
+		CombatController.CameraShake(s.Intensity, s.Duration)
+		local f = FeelConfig.Fov.Break
+		CameraController.FovPunch(f.Delta, f.In, f.Out)
+		if data.Attacker == LocalPlayer then
+			CombatController.Hitstop(attackTrack, hitstopFor(nil, true, false))
+		end
 		if data.Attacker ~= LocalPlayer then
 			local character = LocalPlayer.Character
 			if character then
@@ -495,7 +526,9 @@ local function onCombatEvent(data: any)
 		if character then
 			CombatController.PlayHitReaction(character)
 		end
-		CombatController.CameraShake(0.6, 0.15)
+		local heavy = FeelConfig.FinisherActions[data.Action] == true
+		local s = if heavy then FeelConfig.Shake.Heavy else FeelConfig.Shake.Received
+		CombatController.CameraShake(s.Intensity, s.Duration)
 	end
 end
 
