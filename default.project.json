@@ -2,33 +2,42 @@
   "name": "KombatBlox",
   "tree": {
     "$className": "DataModel",
+
     "ReplicatedStorage": {
-      "$path": "src/ReplicatedStorage"
+      "KombatBlox": {
+        "$className": "Folder",
+        "Config": {
+          "$path": "src/ReplicatedStorage/KombatBlox/Config"
+        },
+        "Modules": {
+          "$path": "src/ReplicatedStorage/KombatBlox/Modules"
+        }
+      }
     },
+
     "ServerScriptService": {
-      "$path": "src/ServerScriptService"
+      "KombatBlox": {
+        "$path": "src/ServerScriptService/KombatBlox"
+      }
     },
-    "ServerStorage": {
-      "$path": "src/ServerStorage"
-    },
+
     "StarterGui": {
       "$properties": {
         "ScreenOrientation": "Sensor"
-      },
-      "$path": "src/StarterGui"
+      }
     },
+
     "StarterPlayer": {
-      "StarterCharacterScripts": {
-        "$path": "src/StarterPlayer/StarterCharacterScripts"
-      },
-      "StarterPlayerScripts": {
-        "$path": "src/StarterPlayer/StarterPlayerScripts"
-      },
       "$properties": {
         "AvatarJointUpgrade": "Enabled",
         "CameraMaxZoomDistance": 128.0,
         "CharacterBreakJointsOnDeath": false,
         "CharacterUseJumpPower": false
+      },
+      "StarterPlayerScripts": {
+        "KombatBlox": {
+          "$path": "src/StarterPlayer/StarterPlayerScripts/KombatBlox"
+        }
       }
     }
   }
