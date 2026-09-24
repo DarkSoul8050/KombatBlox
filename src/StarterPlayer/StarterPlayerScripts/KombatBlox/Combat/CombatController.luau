@@ -16,6 +16,7 @@ local KB = ReplicatedStorage:WaitForChild("KombatBlox")
 local SharedUtil = require(KB.Modules.SharedUtil)
 local CombatConfig = require(KB.Modules.CombatConfig)
 local FeelConfig = require(KB.Config.FeelConfig)
+local Characters = require(KB.Config.Characters)
 local InputController = require(script.Parent.Parent.Input.InputController)
 local CameraController = require(script.Parent.Parent.Camera.CameraController)
 
@@ -481,7 +482,9 @@ local function onCombatEvent(data: any)
 		end
 
 	elseif data.Type == "HitConfirmed" then
-		local cfg = CombatConfig.Actions[data.Action]
+		-- v1.4: el moveset ya no es global; se resuelve por el personaje propio
+		-- (HitConfirmed solo llega a quien golpeo), asi las skills tambien suenan.
+		local cfg = Characters.Resolve(LocalPlayer).MoveSet.Actions[data.Action]
 		CombatController.SpawnHitVFX(data.HitPosition, COLOR_HIT)
 		CombatController.PlayHitSFX(cfg and cfg.HitSFX)
 		-- Peso por accion: finisher = shake fuerte + FOV punch; resto = shake leve.

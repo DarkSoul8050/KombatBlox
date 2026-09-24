@@ -11,6 +11,7 @@ local TweenService = game:GetService("TweenService")
 local KB = ReplicatedStorage:WaitForChild("KombatBlox")
 local SharedUtil = require(KB.Modules.SharedUtil)
 local CombatConfig = require(KB.Modules.CombatConfig)
+local FeelConfig = require(KB.Config.FeelConfig)
 local CombatEvent = SharedUtil.GetRemote("Combat", "CombatEvent")
 local MatchStateChanged = SharedUtil.GetRemote("Match", "MatchStateChanged")
 local GetMatchState = SharedUtil.GetRemote("Match", "GetMatchState")
@@ -123,7 +124,12 @@ local function healthColor(ratio)
 	return COLORS.Low
 end
 
+-- Golpe "pesado" para la sacudida del panel: remate de cadena o habilidad marcada
+-- como finisher en FeelConfig (v1.4: el moveset ya no es global).
 local function isFinisher(action)
+	if FeelConfig.FinisherActions[action] then
+		return true
+	end
 	local cfg = CombatConfig.Actions[action]
 	return cfg ~= nil and cfg.ComboNext == nil
 end
