@@ -27,6 +27,14 @@ local CombatController = {}
 
 local BLOCK = CombatConfig.Block
 local DASH = CombatConfig.Dash
+-- Inputs de combate que el cliente reenvia al servidor (el servidor valida contra
+-- el MoveSet del personaje: v1.4 ya no hay un moveset global en el cliente).
+local FORWARDED_INPUTS: {[string]: boolean} = {
+	LightAttack = true,
+	Skill1 = true,
+	Skill2 = true,
+}
+
 local COLOR_HIT = Color3.fromRGB(255, 230, 150)
 local COLOR_BLOCK = Color3.fromRGB(120, 190, 255)
 local COLOR_BREAK = Color3.fromRGB(255, 120, 40)
@@ -392,8 +400,9 @@ local function requestAction(action: string)
 		return
 	end
 
-	-- Ataques: solo acciones de input conocidas. El SERVIDOR decide el eslabon.
-	if not CombatConfig.InputActions[action] then
+	-- Ataques y habilidades: el cliente solo comprueba que es una accion conocida.
+	-- Quien valida contra el MoveSet del personaje (y energia/cooldown) es el SERVIDOR.
+	if not FORWARDED_INPUTS[action] then
 		SharedUtil.Warn("Combat", "Accion de input no definida: " .. action)
 		return
 	end
