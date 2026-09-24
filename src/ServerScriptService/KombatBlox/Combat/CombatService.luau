@@ -16,6 +16,7 @@ local Debris = game:GetService("Debris")
 local KB = ReplicatedStorage:WaitForChild("KombatBlox")
 local SharedUtil = require(KB.Modules.SharedUtil)
 local CombatConfig = require(KB.Modules.CombatConfig)
+local Characters = require(KB.Config.Characters)
 local Registry = require(script.Parent.Parent.Services.ServiceRegistry)
 
 local RequestAction = SharedUtil.GetRemote("Combat", "RequestAction") :: RemoteEvent
@@ -48,6 +49,14 @@ local function actorInfo(ref: any): (Player?, Model?)
 		end
 	end
 	return nil, nil
+end
+
+-- v1.4: el moveset ya NO es global; se resuelve por el personaje del ACTOR
+-- (atributo KB_CharacterId). Sin personaje asignado -> Default = combate de siempre.
+-- Nota: Block/Dash siguen siendo reglas globales de juego en v1.4; el MoveSet ya
+-- las transporta para poder personalizarlas por personaje en v1.5+.
+local function moveSetOf(ref: any)
+	return Characters.Resolve(ref).MoveSet
 end
 
 local function refName(ref: any): string
@@ -584,7 +593,7 @@ executeAction = function(ref: any, action: string, cfg: any)
 	end
 
 	local nextAction = cfg.ComboNext
-	local nextCfg = nextAction and CombatConfig.Actions[nextAction]
+	local nextCfg = nextAction and moveSetOf(ref).Actions[nextAction]
 
 	if state.Buffered and nextCfg and canAct(ref) then
 		state.Buffered = false
@@ -638,7 +647,8 @@ local function performAction(ref: any, action: string, payload: any)
 		return
 	end
 
-	local rootAction = CombatConfig.InputActions[action]
+	local moveSet = moveSetOf(ref)
+	local rootAction = moveSet.InputActions[action]
 	if not rootAction then
 		SharedUtil.Warn(TAG, refName(ref) .. " unknown action: " .. action)
 		return
@@ -663,7 +673,7 @@ local function performAction(ref: any, action: string, payload: any)
 	end
 
 	local nextAction = resolveNextAction(state, rootAction)
-	local cfg = CombatConfig.Actions[nextAction]
+	local cfg = moveSet.Actions[nextAction]
 	if not cfg then
 		return
 	end
