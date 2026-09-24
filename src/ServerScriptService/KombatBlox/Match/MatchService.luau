@@ -11,6 +11,7 @@ local StarterPlayer = game:GetService("StarterPlayer")
 local KB = ReplicatedStorage:WaitForChild("KombatBlox")
 local SharedUtil = require(KB.Modules.SharedUtil)
 local MatchConfig = require(KB.Modules.MatchConfig)
+local Characters = require(KB.Config.Characters)
 local Registry = require(script.Parent.Parent.Services.ServiceRegistry)
 
 local MatchStateChanged = SharedUtil.GetRemote("Match", "MatchStateChanged")
@@ -239,7 +240,7 @@ local function setMovementLocked(f, locked)
 			hum.JumpPower = 0
 			hum.JumpHeight = 0
 		else
-			hum.WalkSpeed = StarterPlayer.CharacterWalkSpeed
+			hum.WalkSpeed = f.WalkSpeed or StarterPlayer.CharacterWalkSpeed
 			hum.JumpPower = StarterPlayer.CharacterJumpPower
 			hum.JumpHeight = StarterPlayer.CharacterJumpHeight
 		end
@@ -258,7 +259,7 @@ local function setMovementLocked(f, locked)
 		if root then
 			root.Anchored = false
 		end
-		hum.WalkSpeed = StarterPlayer.CharacterWalkSpeed
+		hum.WalkSpeed = f.WalkSpeed or StarterPlayer.CharacterWalkSpeed
 	end
 end
 
@@ -305,6 +306,26 @@ local function buildNpcModel()
 	return model
 end
 
+-- Asigna el personaje al fighter y aplica sus Stats. El atributo KB_CharacterId es lo que
+-- luego usa CombatService para resolver el MoveSet del actor (vale para Player y NPC).
+-- La energia arranca llena cada ronda; a partir de ahi la gestiona CombatService.
+local function applyCharacter(f)
+	local model, hum = f.Model, f.Humanoid
+	if not (model and hum) then
+		return
+	end
+	local character = Characters.Get(f.CharacterId or Characters.PracticeId)
+	f.CharacterId = character.Id
+	f.WalkSpeed = character.Stats.WalkSpeed
+
+	model:SetAttribute(Characters.Attribute, character.Id)
+	model:SetAttribute("KB_MaxEnergy", character.Stats.MaxEnergy)
+	model:SetAttribute("KB_Energy", character.Stats.MaxEnergy)
+
+	hum.MaxHealth = character.Stats.MaxHealth
+	hum.Health = character.Stats.MaxHealth
+end
+
 -- Devuelve true si el fighter quedo listo para la ronda
 local function prepareFighter(f)
 	if not f.SpawnPoint then
@@ -339,6 +360,7 @@ local function prepareFighter(f)
 		f.Model = character
 		f.Humanoid = hum
 		f.Root = root
+		applyCharacter(f)
 		resetCombatState(f)
 		placeModel(character, f.SpawnPoint)
 		setMovementLocked(f, true)
@@ -373,6 +395,7 @@ local function prepareFighter(f)
 	f.Model = model
 	f.Humanoid = hum
 	f.Root = root
+	applyCharacter(f)
 	return true
 end
 
@@ -387,6 +410,7 @@ local function fighterSnapshot(f)
 		Player = f.Player,
 		IsNPC = f.Kind == "NPC",
 		RoundWins = f.RoundWins,
+		CharacterId = f.CharacterId,   -- v1.4 (aditivo): personaje del fighter
 	}
 end
 
