@@ -49,6 +49,7 @@ local COLORS = {
 	Fight = Color3.fromRGB(255, 220, 60),
 	Victory = Color3.fromRGB(255, 205, 70),
 	Defeat = Color3.fromRGB(170, 170, 185),
+	Energy = Color3.fromRGB(90, 170, 255),
 }
 
 local REASON_TEXT = {
@@ -76,6 +77,7 @@ local combatRoot       -- barras + marcador + temporizador (se oculta en Waiting
 local leftBar
 local rightBar
 local timerLabel
+local energyBar        -- v1.4: barra de energia propia
 local banner           -- cartel principal
 local roundBanner      -- cartel de ronda
 local indicators = {}
@@ -622,6 +624,69 @@ local function createIndicator(parent, label)
 	return { Frame = frame, Label = text, Fill = fill, Scale = scale, Tween = nil, PulseTween = nil }
 end
 
+------------------------------------------------------------------
+-- Energia (v1.4): barra del recurso propio. SOLO representacion: el valor real
+-- lo fija el servidor en los atributos KB_Energy / KB_MaxEnergy del personaje.
+------------------------------------------------------------------
+local function createEnergyBar(parent)
+	local holder = make("Frame", {
+		Name = "EnergyBar",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -136),
+		Size = UDim2.new(0, 260, 0, 14),
+		BackgroundColor3 = COLORS.BarBack,
+		BorderSizePixel = 0,
+		ClipsDescendants = true,
+	}, parent)
+	make("UICorner", { CornerRadius = UDim.new(0, 4) }, holder)
+	make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 2, Transparency = 0.4 }, holder)
+
+	local fill = make("Frame", {
+		Name = "Fill",
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = COLORS.Energy,
+		BorderSizePixel = 0,
+	}, holder)
+	make("UICorner", { CornerRadius = UDim.new(0, 4) }, fill)
+
+	local label = make("TextLabel", {
+		Name = "Value",
+		BackgroundTransparency = 1,
+		Size = UDim2.fromScale(1, 1),
+		Font = Enum.Font.GothamBold,
+		TextSize = 11,
+		TextColor3 = COLORS.Text,
+		TextStrokeTransparency = 0.5,
+		Text = "",
+		ZIndex = 2,
+	}, holder)
+
+	return { Frame = holder, Fill = fill, Label = label, Shown = 0 }
+end
+
+-- Lee los atributos del personaje propio y suaviza el relleno (la regeneracion del
+-- servidor llega a ~5 Hz; el suavizado es solo visual).
+local function updateEnergy(dt)
+	local bar = energyBar
+	if not bar then
+		return
+	end
+	local character = LocalPlayer.Character
+	local current = character and character:GetAttribute("KB_Energy")
+	local maxValue = character and character:GetAttribute("KB_MaxEnergy")
+	if typeof(current) ~= "number" or typeof(maxValue) ~= "number" or maxValue <= 0 then
+		bar.Frame.Visible = false
+		return
+	end
+
+	bar.Frame.Visible = true
+	local alpha = 1 - math.exp(-dt * 12)
+	bar.Shown += (current - bar.Shown) * alpha
+	local ratio = math.clamp(bar.Shown / maxValue, 0, 1)
+	bar.Fill.Size = UDim2.fromScale(ratio, 1)
+	bar.Label.Text = ("%d / %d"):format(math.floor(bar.Shown + 0.5), math.floor(maxValue))
+end
+
 local function pulseIndicator(indicator)
 	if indicator.PulseTween then
 		indicator.PulseTween:Cancel()
@@ -807,7 +872,9 @@ applySnapshot = function(snap)
 end
 
 -- Temporizador y cuenta atras: recalculados cada frame a partir del reloj del servidor
-local function renderTick()
+local function renderTick(dt)
+	updateEnergy(dt or 0)   -- v1.4: la energia se pinta siempre que haya personaje
+
 	local snap = snapshot
 	if not snap or snap.State == "Waiting" then
 		timerLabel.Visible = false
@@ -851,6 +918,15 @@ local function onCombatEvent(data)
 	if data.Type == "DashStarted" then
 		if data.Target == LocalPlayer then
 			startCooldown(indicators.Dash, CombatConfig.Dash.Cooldown)
+		end
+		return
+	end
+
+	-- v1.4: cooldown de habilidad (el servidor solo lo manda a quien la lanzo).
+	if data.Type == "SkillUsed" then
+		local indicator = indicators[data.Action]
+		if indicator and (data.Cooldown or 0) > 0 then
+			startCooldown(indicator, data.Cooldown)
 		end
 		return
 	end
@@ -930,6 +1006,13 @@ function UIController:Start()
 		Padding = UDim.new(0, 8),
 	}, indicatorBar)
 	indicators.Dash = createIndicator(indicatorBar, "DASH")
+	-- v1.4: habilidades. La clave coincide con el Action que manda el servidor.
+	indicators.Skill1 = createIndicator(indicatorBar, "E")
+	indicators.Skill2 = createIndicator(indicatorBar, "R")
+
+	-- v1.4: barra de energia (recurso unico). El servidor es la autoridad; aqui
+	-- solo se pinta el valor replicado en los atributos del personaje.
+	energyBar = createEnergyBar(hud)
 
 	CombatEvent.OnClientEvent:Connect(onCombatEvent)
 	MatchStateChanged.OnClientEvent:Connect(applySnapshot)
