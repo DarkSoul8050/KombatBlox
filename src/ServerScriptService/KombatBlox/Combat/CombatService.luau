@@ -105,6 +105,8 @@ type ActorState = {
 	LastAction: {[string]: number},
 	WindowStart: number,
 	WindowCount: number,
+	Energy: number,              -- v1.4: recurso unico (server-authoritative)
+	LastEnergyUpdate: number,    -- para regeneracion perezosa (sin bucle por frame)
 }
 local states: {[any]: ActorState} = {}
 
@@ -127,10 +129,52 @@ local function getState(ref: any): ActorState
 			LastAction = {},
 			WindowStart = os.clock(),
 			WindowCount = 0,
+			Energy = Characters.Resolve(ref).Stats.MaxEnergy or 100,
+			LastEnergyUpdate = os.clock(),
 		}
 		states[ref] = s
 	end
 	return s
+end
+
+------------------------------------------------------------------
+-- Energia (recurso unico, v1.4). SIEMPRE autoridad del servidor:
+-- el cliente solo lee los atributos KB_Energy / KB_MaxEnergy para pintar la barra.
+-- Regeneracion perezosa: se calcula al consultar, no en un bucle por frame.
+------------------------------------------------------------------
+local function energyNow(ref: any, state: ActorState, now: number): (number, number)
+	local stats = Characters.Resolve(ref).Stats
+	local maxE = stats.MaxEnergy or 100
+	local regen = stats.RegenRate or 0
+	local value = math.min(maxE, state.Energy + regen * math.max(0, now - state.LastEnergyUpdate))
+	return value, maxE
+end
+
+local function setEnergy(ref: any, state: ActorState, value: number, maxE: number, now: number)
+	state.Energy = math.clamp(value, 0, maxE)
+	state.LastEnergyUpdate = now
+	local _, model = actorInfo(ref)
+	if model then
+		model:SetAttribute("KB_Energy", math.floor(state.Energy + 0.5))
+		model:SetAttribute("KB_MaxEnergy", maxE)
+	end
+end
+
+-- Devuelve true si habia energia suficiente (y la descuenta).
+local function trySpendEnergy(ref: any, state: ActorState, cost: number, now: number): boolean
+	local value, maxE = energyNow(ref, state, now)
+	if cost > 0 and value < cost then
+		setEnergy(ref, state, value, maxE, now)   -- refresca el atributo aunque no gaste
+		return false
+	end
+	setEnergy(ref, state, value - cost, maxE, now)
+	return true
+end
+
+local function refillEnergy(ref: any, state: ActorState)
+	local stats = Characters.Resolve(ref).Stats
+	local maxE = stats.MaxEnergy or 100
+	setEnergy(ref, state, maxE, maxE, os.clock())
 end
 
 local function resetCombo(state: ActorState)
@@ -339,6 +383,49 @@ local function startDash(ref: any, rawDirection: any)
 		if current.State == S.Dashing then
 			current.State = S.Idle
 		end
+	end)
+end
+
+-- Lunge de habilidad: mismo LinearVelocity que el Dash, pero NO cambia de estado
+-- (el actor sigue en Attacking) ni consume el cooldown de dash. Limpieza por DashToken.
+local function startLunge(ref: any, distance: number, duration: number)
+	local model, root = getLiving(ref)
+	if not (model and root) then
+		return
+	end
+	local s = getState(ref)
+	stopDash(ref)                 -- limpia impulso previo y avanza el token
+	local token = s.DashToken
+
+	local look = root.CFrame.LookVector
+	local flatLook = Vector3.new(look.X, 0, look.Z)
+	local direction = if flatLook.Magnitude > 0.01 then flatLook.Unit else Vector3.new(0, 0, -1)
+	local speed = distance / math.max(duration, 0.01)
+
+	local attachment = Instance.new("Attachment")
+	attachment.Name = "KB_LungeAttachment"
+
+	local velocity = Instance.new("LinearVelocity")
+	velocity.Name = "KB_Lunge"
+	velocity.Attachment0 = attachment
+	velocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Plane
+	velocity.PrimaryTangentAxis = Vector3.xAxis
+	velocity.SecondaryTangentAxis = Vector3.zAxis
+	velocity.PlaneVelocity = Vector2.new(direction.X * speed, direction.Z * speed)
+	velocity.ForceLimitMode = Enum.ForceLimitMode.Magnitude
+	velocity.MaxForce = DASH.MaxForce
+	velocity.Parent = attachment
+
+	attachment.Parent = root
+	s.DashAttachment = attachment
+
+	task.delay(duration, function()
+		local current = states[ref]
+		if not current or current.DashToken ~= token then
+			return
+		end
+		stopDash(ref)
 	end)
 end
 
@@ -615,6 +702,105 @@ executeAction = function(ref: any, action: string, cfg: any)
 	end
 end
 
+------------------------------------------------------------------
+-- Habilidades (Type = "Special"): accion SUELTA, sin cadena de combo.
+-- Coste de energia + cooldown propios; opcionalmente con movimiento (lunge).
+-- Reutiliza queryHitbox/onHit/CanHit/tokens => hereda seguridad PvP, hitstun,
+-- guard break y el feel de v1.3 sin duplicar nada.
+------------------------------------------------------------------
+local function executeSpecial(ref: any, actionId: string, cfg: any)
+	local state = getState(ref)
+	state.ActionToken += 1
+	local token = state.ActionToken
+
+	local player, model = actorInfo(ref)
+
+	state.State = S.Attacking
+	state.BufferOpen = false
+	state.Buffered = false
+	SharedUtil.Log(TAG, ("%s (special) started"):format(actionId))
+
+	CombatEvent:FireAllClients({
+		Type = "ActionStarted",
+		Action = actionId,
+		Animation = cfg.Animation,
+		AttackSFX = cfg.AttackSFX,
+		ComboIndex = 0,
+		Attacker = player,
+		AttackerModel = model,
+	})
+
+	if player then
+		CombatEvent:FireClient(player, {
+			Type = "SkillUsed",
+			Action = actionId,
+			Cooldown = cfg.Cooldown or 0,
+		})
+	end
+
+	-- Componente de movimiento opcional (Skill2: Dash Strike)
+	if cfg.LungeDistance and cfg.LungeDuration then
+		startLunge(ref, cfg.LungeDistance, cfg.LungeDuration)
+	end
+
+	task.wait(cfg.Startup)
+	if state.ActionToken ~= token then
+		return
+	end
+
+	local hitSet: {[Humanoid]: boolean} = {}
+	local hitCount = 0
+	local blockedCount = 0
+	local char, root = getLiving(ref)
+	if char and root and canDealDamage(ref) then
+		debugBox(root.CFrame * CFrame.new(cfg.HitboxOffset), cfg.HitboxSize, cfg.ActiveTime)
+		local elapsed = 0
+		while elapsed < cfg.ActiveTime do
+			if state.ActionToken ~= token then
+				return
+			end
+			local c, r = getLiving(ref)
+			if not (c and r) then
+				break
+			end
+			if not canDealDamage(ref) then
+				break
+			end
+			for _, hum in queryHitbox(c, r, cfg) do
+				if not hitSet[hum] then
+					hitSet[hum] = true
+					local outcome = onHit(ref, c, actionId, cfg, hum, r)
+					if outcome == "blocked" then
+						blockedCount += 1
+					elseif outcome ~= "none" then
+						hitCount += 1
+					end
+				end
+			end
+			elapsed += task.wait(CombatConfig.HitboxTickRate)
+		end
+	end
+
+	if player then
+		CombatEvent:FireClient(player, {
+			Type = "AttackResult",
+			Action = actionId,
+			Hit = hitCount > 0,
+			Targets = hitCount,
+			Blocked = blockedCount,
+		})
+	end
+
+	task.wait(cfg.Recovery)
+	if state.ActionToken ~= token then
+		return
+	end
+	if state.State == S.Attacking then
+		state.State = S.Idle
+	end
+	resetCombo(state)
+end
+
 local function resolveNextAction(state: ActorState, rootAction: string): string
 	if state.ComboNext and os.clock() <= state.ComboExpires then
 		return state.ComboNext
@@ -669,6 +855,24 @@ local function performAction(ref: any, action: string, payload: any)
 
 	local character, root = getLiving(ref)
 	if not character or not root then
+		return
+	end
+
+	-- Habilidad (Special): no pasa por la cadena de combo. Cooldown + coste de energia.
+	local direct = moveSet.Actions[rootAction]
+	if direct and direct.Type == "Special" then
+		local now = os.clock()
+		local last = state.LastAction[rootAction]
+		if direct.Cooldown and direct.Cooldown > 0 and last and now - last < direct.Cooldown then
+			return
+		end
+		if not trySpendEnergy(ref, state, direct.Cost or 0, now) then
+			return
+		end
+		state.LastAction[rootAction] = now
+		resetCombo(state)   -- una habilidad corta la cadena M1
+		SharedUtil.Log(TAG, refName(ref) .. " " .. rootAction .. " (special) requested")
+		task.spawn(executeSpecial, ref, rootAction, direct)
 		return
 	end
 
@@ -744,6 +948,7 @@ function CombatService.ResetFighter(actorRef: Actor)
 	s.StunToken += 1
 	s.ActionToken += 1
 	s.State = S.Idle
+	refillEnergy(actorRef, s)   -- cada ronda empieza con la energia llena
 end
 
 -- Libera el estado asociado a un actor (evita fugas al descartar el Model de un NPC).
@@ -792,6 +997,30 @@ function CombatService:Start()
 
 	Players.PlayerRemoving:Connect(function(player)
 		states[player] = nil
+	end)
+
+	-- Publica la energia en los atributos a baja frecuencia para que el HUD vea la
+	-- regeneracion. No muta el estado (la regen sigue siendo perezosa); solo informa.
+	task.spawn(function()
+		while true do
+			task.wait(0.2)
+			local now = os.clock()
+			local refs: {any} = {}
+			for ref in states do
+				table.insert(refs, ref)
+			end
+			for _, ref in refs do
+				local s = states[ref]
+				if s then
+					local value, maxE = energyNow(ref, s, now)
+					local _, model = actorInfo(ref)
+					if model then
+						model:SetAttribute("KB_Energy", math.floor(value + 0.5))
+						model:SetAttribute("KB_MaxEnergy", maxE)
+					end
+				end
+			end
+		end
 	end)
 end
 
