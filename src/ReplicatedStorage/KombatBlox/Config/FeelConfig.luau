@@ -11,6 +11,9 @@ return table.freeze({
 			M1_2 = 0.025,
 			M1_3 = 0.030,
 			M1_4 = 0.055,
+			-- v1.4: habilidades
+			Skill1 = 0.060,
+			Skill2 = 0.040,
 		},
 		GuardBreak = 0.060,
 		ReceivedMultiplier = 0.7,   -- el golpe recibido pesa algo menos que el dado
@@ -19,6 +22,7 @@ return table.freeze({
 	-- Acciones consideradas "pesadas" (finisher) para shake/FOV fuertes.
 	FinisherActions = {
 		M1_4 = true,
+		Skill1 = true,   -- v1.4: Heavy Palm pesa como finisher (shake fuerte + FOV)
 	},
 
 	-- Camera shake por evento: { Intensity, Duration }.

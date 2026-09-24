@@ -264,6 +264,16 @@ function DummyBrain:Update(rivalModel: Model?)
 	if self.mode == "Engage" then
 		stopMove(hum)
 
+		-- v1.4: a veces lanza una habilidad (misma interfaz que un jugador).
+		-- No comprueba energia ni cooldown: esa autoridad es del servidor, que
+		-- rechaza en silencio si no procede.
+		if self.comboStep == 0 and math.random() < (P.SkillChance or 0) then
+			local skill = if math.random() < 0.5 then "Skill1" else "Skill2"
+			self.lastAttackAt = now
+			Combat.PerformAction(model, skill)
+			return
+		end
+
 		local step = self.comboStep
 		if step == 0 then
 			self:_attack(model, now)

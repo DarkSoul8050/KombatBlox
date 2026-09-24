@@ -39,6 +39,7 @@ export type Profile = {
 
 	PunishWindow: number,       -- s de ventana para castigar cuando el rival termina/falla un ataque
 	StrafeChance: number,       -- prob. de rodear (strafe) al reposicionar en vez de recto
+	SkillChance: number,        -- prob. de usar una habilidad en rango (el servidor valida energia/cooldown)
 
 	FacePlayer: boolean,
 	TurnResponsiveness: number, -- AlignOrientation: mayor = giro mas firme
@@ -72,6 +73,7 @@ local Easy: Profile = {
 
 	PunishWindow = 0.12,
 	StrafeChance = 0.10,
+	SkillChance = 0.10,
 
 	FacePlayer = true,
 	TurnResponsiveness = 25,
@@ -105,6 +107,7 @@ local Normal: Profile = {
 
 	PunishWindow = 0.30,
 	StrafeChance = 0.25,
+	SkillChance = 0.20,
 
 	FacePlayer = true,
 	TurnResponsiveness = 40,
@@ -138,6 +141,7 @@ local Hard: Profile = {
 
 	PunishWindow = 0.45,
 	StrafeChance = 0.40,
+	SkillChance = 0.35,
 
 	FacePlayer = true,
 	TurnResponsiveness = 60,
